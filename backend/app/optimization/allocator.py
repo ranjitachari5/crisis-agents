@@ -188,8 +188,28 @@ def _lp(p: AllocationProblem, lb: np.ndarray, ub: np.ndarray, degradation: bool,
 
 
 def _finish(p: AllocationProblem, ids: list[str], a: np.ndarray, M: np.ndarray, degradation: bool,
-            info: SolverInfo, t0: float) -> AllocationSolution:
-    alloc = {i: round(float(v), 3) for i, v in zip(ids, a)}
+            info: SolverInfo, t0: float, lower_bounds: np.ndarray | None = None) -> AllocationSolution:
+    lower = np.array(lower_bounds, float) if lower_bounds is not None else (np.zeros(len(ids), float)
+                                                                          if degradation else M.copy())
+    upper = np.minimum(np.array([p.demand.get(i, 0.0) for i in ids], float),
+                       np.array([p.max_allowed.get(i, float("inf")) for i in ids], float))
+    lower_q = np.ceil(np.maximum(lower, 0.0) * 1000.0) / 1000.0
+    upper_q = np.floor(np.where(np.isfinite(upper), upper, np.inf) * 1000.0) / 1000.0
+    rounded = np.clip(np.round(np.asarray(a, float), 3), lower_q, upper_q)
+    while float(rounded.sum()) > float(p.supply) + 1e-9:
+        order = np.argsort(rounded - lower_q)[::-1]
+        reduced = False
+        for idx in order:
+            if rounded[idx] <= lower_q[idx] + 1e-9:
+                continue
+            if rounded[idx] - lower_q[idx] < 0.001 - 1e-9:
+                continue
+            rounded[idx] = round(max(lower_q[idx], rounded[idx] - 0.001), 3)
+            reduced = True
+            break
+        if not reduced:
+            break
+    alloc = {i: round(float(v), 3) for i, v in zip(ids, rounded)}
     shortages = {i: round(float(M[k] - a[k]), 3) for k, i in enumerate(ids) if M[k] - a[k] > 1e-3}
     info.solve_ms = round((time.perf_counter() - t0) * 1000, 3)
     return AllocationSolution(alloc, bool(degradation), evaluate_objective(p, alloc), shortages, info.solver, info)
@@ -208,7 +228,8 @@ def solve(p: AllocationProblem, method: str = "auto") -> AllocationSolution:
         return _finish(p, ids, np.zeros(0), M, False, SolverInfo("trivial", "trivial"), t0)
 
     if ub.sum() <= supply + EPS:
-        return _finish(p, ids, ub, M, False, SolverInfo("no_deficit", "optimal"), t0)
+        lb = np.zeros(n)
+        return _finish(p, ids, ub, M, False, SolverInfo("no_deficit", "optimal"), t0, lb)
 
     degradation = M.sum() > supply + EPS
     lb = np.zeros(n) if degradation else M.copy()
@@ -222,10 +243,10 @@ def solve(p: AllocationProblem, method: str = "auto") -> AllocationSolution:
         # Objective is linear here (critical shortfall dominates in degradation):
         # the greedy fractional knapsack is the exact optimum.
         a = _repair(_greedy(p, lb, ub, degradation), lb, ub, supply)
-        return _finish(p, ids, a, M, degradation, SolverInfo("greedy_exact", "optimal"), t0)
+        return _finish(p, ids, a, M, degradation, SolverInfo("greedy_exact", "optimal"), t0, lb)
     if method == "lp":
         x, nit = _lp(p, lb, ub, degradation, supply, p.time_budget_s)
-        return _finish(p, ids, _repair(x, lb, ub, supply), M, degradation, SolverInfo("lp", "optimal", nit), t0)
+        return _finish(p, ids, _repair(x, lb, ub, supply), M, degradation, SolverInfo("lp", "optimal", nit), t0, lb)
 
     Dsum = max(D.sum(), EPS)
     wd = max(float(np.sum(w * D)), EPS)
@@ -282,7 +303,7 @@ def solve(p: AllocationProblem, method: str = "auto") -> AllocationSolution:
         if not (res.success or (res.status == 8 and feasible)) or not finite:
             raise RuntimeError(f"SLSQP status {res.status}: {res.message}")
         info = SolverInfo("slsqp", "optimal" if res.success else "optimal_tolerance", int(res.nit))
-        return _finish(p, ids, _repair(res.x[:n], lb, ub, supply), M, degradation, info, t0)
+        return _finish(p, ids, _repair(res.x[:n], lb, ub, supply), M, degradation, info, t0, lb)
     except Exception as exc:  # noqa: BLE001 - every failure falls through the chain
         attempts.append({"solver": "slsqp", "error": f"{type(exc).__name__}: {exc}"[:200]})
         log.warning("SLSQP failed (%s); falling back to LP", attempts[-1]["error"])
@@ -291,10 +312,10 @@ def solve(p: AllocationProblem, method: str = "auto") -> AllocationSolution:
     try:
         x, nit = _lp(p, lb, ub, degradation, supply, max(0.05, p.time_budget_s))
         info = SolverInfo("lp", "fallback", nit, fallback_reason=attempts[0]["error"], attempts=attempts)
-        return _finish(p, ids, _repair(x, lb, ub, supply), M, degradation, info, t0)
+        return _finish(p, ids, _repair(x, lb, ub, supply), M, degradation, info, t0, lb)
     except Exception as exc:  # noqa: BLE001
         attempts.append({"solver": "lp", "error": f"{type(exc).__name__}: {exc}"[:200]})
         log.warning("LP fallback failed (%s); using greedy allocation", attempts[-1]["error"])
     a = _repair(_greedy(p, lb, ub, degradation), lb, ub, supply)
     info = SolverInfo("greedy_fallback", "fallback", fallback_reason=attempts[0]["error"], attempts=attempts)
-    return _finish(p, ids, a, M, degradation, info, t0)
+    return _finish(p, ids, a, M, degradation, info, t0, lb)

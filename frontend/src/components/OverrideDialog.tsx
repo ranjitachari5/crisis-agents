@@ -5,6 +5,7 @@ import { formatMw } from "@/lib/format";
 import { api } from "@/services/api";
 import { errorMessage } from "@/lib/errors";
 import { useSimStore } from "@/store/useSimStore";
+import { useAuthStore } from "@/store/useAuthStore";
 import type { ConsumerId, ValidationResult } from "@/types/api";
 
 interface Props {
@@ -35,8 +36,8 @@ export function OverrideDialog({ isOpen, onClose, onSuccess }: Props) {
 
   const [allocations, setAllocations] = useState<Record<ConsumerId, number>>(getInitialAllocations);
   const [reason, setReason] = useState<string>("Emergency manual rebalancing by Commander");
-  // Security constraint: Token kept strictly in local memory state only
-  const [authToken, setAuthToken] = useState<string>("");
+  // Auth token from centralized store — sent via Authorization header, not in the request body
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
 
   const [isValidating, setIsValidating] = useState(false);
   const [isCommitting, setIsCommitting] = useState(false);
@@ -74,11 +75,11 @@ export function OverrideDialog({ isOpen, onClose, onSuccess }: Props) {
     }
   };
 
-  // Step 2: Commit override with authorization token
+  // Step 2: Commit override — token is sent via the Authorization header automatically
   const handleCommit = async () => {
     if (!validated) return;
-    if (!authToken.trim()) {
-      setApiError("Commander authorization token is required");
+    if (!isAuthenticated) {
+      setApiError("Commander authorization token is required — set it in the top bar");
       return;
     }
     if (reason.trim().length < 5) {
@@ -89,7 +90,7 @@ export function OverrideDialog({ isOpen, onClose, onSuccess }: Props) {
     setIsCommitting(true);
     setApiError(null);
     try {
-      await api.commander.override(allocations, reason.trim(), authToken.trim());
+      await api.commander.override(allocations, reason.trim());
       onSuccess("Allocation override committed successfully by Commander.");
       onClose();
     } catch (err) {
@@ -266,23 +267,25 @@ export function OverrideDialog({ isOpen, onClose, onSuccess }: Props) {
             />
           </div>
 
-          {/* Commander Auth Token (In-Memory Only) */}
+          {/* Commander Auth Status */}
           <div>
             <div className="flex items-center justify-between mb-1">
               <label className="text-11 uppercase font-semibold text-muted tracking-wider block">
-                Commander Authorization Token
+                Commander Authorization
               </label>
-              <span className="text-11 text-muted">Kept in memory only</span>
+              <span className="text-11 text-muted">Via bearer token header</span>
             </div>
-            <div className="relative">
-              <input
-                type="password"
-                value={authToken}
-                onChange={(e) => setAuthToken(e.target.value)}
-                placeholder="Enter COMMANDER_AUTH_TOKEN"
-                className="w-full pl-8 pr-3 py-1.5 text-13 bg-surface-2 rounded border border-border text-text placeholder:text-muted/60 focus:outline-none focus:border-accent font-mono"
-              />
-              <KeyRound className="w-4 h-4 text-muted absolute left-2.5 top-2.5 pointer-events-none" />
+            <div className={`p-2.5 rounded border text-12 flex items-center gap-2 ${
+              isAuthenticated
+                ? "bg-ok/10 border-ok/30 text-text"
+                : "bg-accent-dim border-accent/40 text-accent"
+            }`}>
+              <KeyRound className="w-4 h-4 shrink-0" />
+              <span>
+                {isAuthenticated
+                  ? "Token configured — authorization will be sent via HTTP header"
+                  : "No token set — enter your COMMANDER_AUTH_TOKEN in the top bar first"}
+              </span>
             </div>
           </div>
 
@@ -320,7 +323,7 @@ export function OverrideDialog({ isOpen, onClose, onSuccess }: Props) {
             <button
               type="button"
               onClick={handleCommit}
-              disabled={!validated || isCommitting || !authToken.trim()}
+              disabled={!validated || isCommitting || !isAuthenticated}
               className="px-3 py-1.5 rounded bg-accent hover:bg-accent/90 text-white text-12 font-medium transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {isCommitting ? "Committing…" : "Step 2: Commit Override"}

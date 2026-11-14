@@ -1,12 +1,4 @@
-import { useMemo } from "react";
-import ReactFlow, {
-  type Node,
-  type Edge,
-  type EdgeProps,
-  type NodeProps,
-  getStraightPath,
-} from "reactflow";
-import "reactflow/dist/style.css";
+import { useMemo, useState } from "react";
 import {
   HeartPulse,
   Droplets,
@@ -15,321 +7,384 @@ import {
   BatteryCharging,
   Zap,
   Scale,
+  Layers,
+  ArrowRightLeft,
 } from "lucide-react";
 import { AGENTS, edgeId } from "@/lib/agents";
 import { HUB_NODE_ID } from "@/lib/constants";
 import { useAgentActivity } from "@/hooks/useAgentActivity";
 import { useSimStore } from "@/store/useSimStore";
+import { formatMw } from "@/lib/format";
 import type { AgentId, AgentView } from "@/types/api";
 
-// ---------------------------------------------------- Custom Node Component
-function AgentNetworkNode({ data }: NodeProps<{ agentId: string; isHub?: boolean }>) {
-  const { getAgentHighlight } = useAgentActivity();
+interface AgentCoord {
+  id: AgentId;
+  x: number; // SVG viewBox X (0..1000)
+  y: number; // SVG viewBox Y (0..600)
+  pctX: number; // CSS % left
+  pctY: number; // CSS % top
+}
+
+export function AgentNetwork() {
   const snapshot = useSimStore((s) => s.snapshot);
   const setSelectedAgent = useSimStore((s) => s.setSelectedAgent);
+  const { getAgentHighlight, getEdgeHighlight } = useAgentActivity();
+  const [hoveredNode, setHoveredNode] = useState<string | null>(null);
 
-  const { agentId, isHub } = data;
+  // SVG canvas geometry: 1000 x 600
+  const cx = 500;
+  const cy = 300;
 
-  if (isHub) {
-    return (
-      <div className="px-3.5 py-2.5 rounded-panel bg-surface-2 border border-border text-center select-none shadow-sm min-w-[130px]">
-        <div className="flex items-center justify-center gap-1.5 text-muted mb-0.5">
-          <Scale size={14} strokeWidth={1.5} />
-          <span className="text-11 uppercase font-semibold tracking-wider text-text">Hub</span>
-        </div>
-        <span className="text-11 text-muted">Negotiation Group</span>
-      </div>
-    );
-  }
+  // 6 Radial Agent Positions: generous margins so all text sits cleanly with zero overlap
+  const agentCoords: AgentCoord[] = useMemo(() => [
+    // Top: Grid Supply
+    { id: "grid_agent", x: 500, y: 85, pctX: 50, pctY: 14 },
+    // Top-Right: Battery Storage
+    { id: "battery_agent", x: 800, y: 175, pctX: 80, pctY: 29 },
+    // Bottom-Right: Hospital Agent (Critical Consumer)
+    { id: "hospital_agent", x: 800, y: 425, pctX: 80, pctY: 71 },
+    // Bottom: Water Utility
+    { id: "water_agent", x: 500, y: 515, pctX: 50, pctY: 86 },
+    // Bottom-Left: Telecom Utility
+    { id: "telecom_agent", x: 200, y: 425, pctX: 20, pctY: 71 },
+    // Top-Left: Emergency Services
+    { id: "emergency_agent", x: 200, y: 175, pctX: 20, pctY: 29 },
+  ], []);
 
-  const meta = AGENTS[agentId as AgentId];
-  const agentView = snapshot?.agents?.find((a: AgentView) => a.agent_id === agentId);
-  const status = agentView?.status ?? "online";
-  const isIsolated = status === "isolated";
-  const isDisconnected = status === "disconnected";
-  const isDimmed = isIsolated || isDisconnected;
+  // Hub Spoke Edges (Agent <-> Hub)
+  const hubEdges = useMemo(() => {
+    return agentCoords.map((c, idx) => {
+      const eId = edgeId(c.id, HUB_NODE_ID);
+      const isHovered = hoveredNode === c.id || hoveredNode === HUB_NODE_ID;
+      const { isLit } = getEdgeHighlight(eId);
+      const duration = isLit ? 1.0 : 2.5 + (idx % 3) * 0.4;
 
-  const highlight = getAgentHighlight(agentId);
+      return {
+        id: eId,
+        source: c.id,
+        target: HUB_NODE_ID,
+        path: `M ${c.x},${c.y} L ${cx},${cy}`,
+        reversePath: `M ${cx},${cy} L ${c.x},${c.y}`,
+        isLit,
+        isHovered,
+        duration,
+      };
+    });
+  }, [agentCoords, hoveredNode, getEdgeHighlight]);
 
-  let borderBgClass = "border-border bg-surface";
-  if (highlight.isRequesting) {
-    borderBgClass = "border-accent bg-accent-dim transition-all duration-200";
-  } else if (highlight.isSupplyFlash) {
-    borderBgClass = "border-white/80 bg-surface transition-all duration-200";
-  }
+  // Peer Dependency Edges between utilities
+  const peerEdges = useMemo(() => {
+    const list = [
+      { from: "water_agent", to: "hospital_agent", path: `M 500,515 Q 670,515 800,425`, d: 3.2 },
+      { from: "telecom_agent", to: "hospital_agent", path: `M 200,425 Q 500,465 800,425`, d: 3.8 },
+      { from: "water_agent", to: "emergency_agent", path: `M 500,515 Q 310,420 200,175`, d: 3.5 },
+      { from: "telecom_agent", to: "emergency_agent", path: `M 200,425 L 200,175`, d: 2.8 },
+    ];
 
-  const renderIcon = () => {
-    const props = { size: 14, strokeWidth: 1.5, className: "shrink-0" };
+    return list.map((item) => {
+      const eId = edgeId(item.from, item.to);
+      const isHovered = hoveredNode === item.from || hoveredNode === item.to;
+      const { isLit } = getEdgeHighlight(eId);
+
+      return {
+        id: eId,
+        path: item.path,
+        isLit,
+        isHovered,
+        duration: isLit ? 1.2 : item.d,
+      };
+    });
+  }, [hoveredNode, getEdgeHighlight]);
+
+  const renderIcon = (agentId: string) => {
+    const props = { size: 15, strokeWidth: 1.8, className: "shrink-0" };
     switch (agentId) {
       case "hospital_agent":
-        return <HeartPulse {...props} />;
+        return <HeartPulse {...props} className="text-[#F43F5E]" />;
       case "water_agent":
-        return <Droplets {...props} />;
+        return <Droplets {...props} className="text-[#38BDF8]" />;
       case "telecom_agent":
-        return <RadioTower {...props} />;
+        return <RadioTower {...props} className="text-[#A78BFA]" />;
       case "emergency_agent":
-        return <Siren {...props} />;
+        return <Siren {...props} className="text-[#FB923C]" />;
       case "battery_agent":
-        return <BatteryCharging {...props} />;
+        return <BatteryCharging {...props} className="text-[#34D399]" />;
       case "grid_agent":
-        return <Zap {...props} />;
+        return <Zap {...props} className="text-[#FBBF24]" />;
       default:
         return <Zap {...props} />;
     }
   };
 
-  const statusColor =
-    status === "online"
-      ? "bg-ok"
-      : status === "isolated"
-      ? "bg-accent"
-      : "bg-muted";
-
-  return (
-    <div
-      onClick={() => setSelectedAgent(agentId as AgentId)}
-      className={`px-3 py-2 rounded-panel border text-left cursor-pointer select-none transition-all duration-200 min-w-[140px] ${borderBgClass} ${
-        isDimmed ? "opacity-50" : ""
-      }`}
-    >
-      <div className="flex items-center justify-between gap-1.5">
-        <div className="flex items-center gap-1.5 min-w-0">
-          <div className="text-muted">{renderIcon()}</div>
-          <span className="text-12 font-medium text-text truncate">
-            {meta?.name ?? agentId}
-          </span>
-        </div>
-        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusColor}`} />
-      </div>
-
-      <div className="mt-1 flex items-center justify-between text-11 text-muted">
-        <span className="truncate">{meta?.role?.split("&")[0] ?? ""}</span>
-        {highlight.isRequesting && (
-          <span className="text-accent font-medium ml-1">Req</span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------- Custom Edge Component
-function AgentNetworkEdge({
-  id,
-  sourceX,
-  sourceY,
-  targetX,
-  targetY,
-  data,
-}: EdgeProps<{ isDashed?: boolean }>) {
-  const { getEdgeHighlight } = useAgentActivity();
-  const { isLit, dotActive } = getEdgeHighlight(id);
-
-  const [edgePath] = getStraightPath({
-    sourceX,
-    sourceY,
-    targetX,
-    targetY,
-  });
-
-  const strokeColor = isLit ? "#E5484D" : "#26262B";
-  const strokeWidth = isLit ? 2 : 1.5;
-  const isDashed = data?.isDashed ?? false;
-
-  return (
-    <>
-      <path
-        id={id}
-        className="react-flow__edge-path transition-colors duration-200"
-        d={edgePath}
-        stroke={strokeColor}
-        strokeWidth={strokeWidth}
-        strokeDasharray={isDashed ? "4 4" : undefined}
-      />
-
-      {dotActive && (
-        <circle r={3.5} fill="#E5484D">
-          <animateMotion
-            dur="800ms"
-            repeatCount="1"
-            fill="freeze"
-            path={edgePath}
-          />
-        </circle>
-      )}
-    </>
-  );
-}
-
-// Node types registry
-const nodeTypes = {
-  agentNode: AgentNetworkNode,
-};
-
-const edgeTypes = {
-  customEdge: AgentNetworkEdge,
-};
-
-// ---------------------------------------------------- Main Network Component
-export function AgentNetwork() {
-  const snapshot = useSimStore((s) => s.snapshot);
-  const twinGraph = useSimStore((s) => s.twinGraph);
-  const edgeActivity = useSimStore((s) => s.edgeActivity);
-
-  // Position nodes radially around the central hub (center: 360, 220, radius: 180)
-  const nodes: Node[] = useMemo(() => {
-    const cx = 360;
-    const cy = 200;
-    const r = 160;
-
-    // Ordered layout
-    const agentOrder: AgentId[] = [
-      "grid_agent",
-      "battery_agent",
-      "hospital_agent",
-      "water_agent",
-      "telecom_agent",
-      "emergency_agent",
-    ];
-
-    const result: Node[] = [
-      // Central Hub Node
-      {
-        id: HUB_NODE_ID,
-        type: "agentNode",
-        position: { x: cx - 65, y: cy - 25 },
-        data: { agentId: HUB_NODE_ID, isHub: true },
-        draggable: false,
-      },
-    ];
-
-    // Radial Agent Nodes
-    agentOrder.forEach((aid, idx) => {
-      // Offset by -pi/2 so grid_agent is at the very top
-      const angle = (idx * 2 * Math.PI) / agentOrder.length - Math.PI / 2;
-      const x = cx + r * Math.cos(angle) - 70;
-      const y = cy + r * Math.sin(angle) - 25;
-
-      result.push({
-        id: aid,
-        type: "agentNode",
-        position: { x, y },
-        data: { agentId: aid, isHub: false },
-        draggable: false,
-      });
-    });
-
-    return result;
-  }, []);
-
-  // Build edges:
-  // 1. Hub edges from every agent to negotiation_group
-  // 2. Twin dependency & power edges between agents
-  // 3. Dynamic edges if active message pair doesn't exist
-  const edges: Edge[] = useMemo(() => {
-    const edgeMap = new Map<string, Edge>();
-
-    const agentsList = snapshot?.agents ?? [];
-    const isAgentDisconnected = (aid: string) => {
-      const a = agentsList.find((v: AgentView) => v.agent_id === aid);
-      return a?.status === "isolated" || a?.status === "disconnected";
-    };
-
-    // 1. Base edges: every agent to hub
-    const agentIds: AgentId[] = [
-      "grid_agent",
-      "battery_agent",
-      "hospital_agent",
-      "water_agent",
-      "telecom_agent",
-      "emergency_agent",
-    ];
-
-    agentIds.forEach((aid) => {
-      const eId = edgeId(aid, HUB_NODE_ID);
-      const dashed = isAgentDisconnected(aid);
-      edgeMap.set(eId, {
-        id: eId,
-        source: aid,
-        target: HUB_NODE_ID,
-        type: "customEdge",
-        data: { isDashed: dashed },
-      });
-    });
-
-    // 2. Inter-agent edges derived from twin dependency & power edges
-    if (twinGraph?.edges) {
-      twinGraph.edges.forEach((te) => {
-        // Only if both source and target are among the 6 agents
-        if (agentIds.includes(te.source as AgentId) && agentIds.includes(te.target as AgentId)) {
-          const eId = edgeId(te.source, te.target);
-          if (!edgeMap.has(eId)) {
-            const dashed =
-              te.kind === "dependency" ||
-              isAgentDisconnected(te.source) ||
-              isAgentDisconnected(te.target);
-            edgeMap.set(eId, {
-              id: eId,
-              source: te.source,
-              target: te.target,
-              type: "customEdge",
-              data: { isDashed: dashed },
-            });
-          }
-        }
-      });
+  const getAgentMetric = (agentId: string) => {
+    const a = snapshot?.agents?.find((v: AgentView) => v.agent_id === agentId);
+    if (!a) return { label: "Telemetry", val: "Connecting…" };
+    if (a.kind === "consumer") {
+      return {
+        label: "Allocated / Demand",
+        val: `${formatMw(a.allocation_mw)} / ${formatMw(a.demand_mw)}`,
+      };
     }
+    if (a.kind === "storage") {
+      return {
+        label: "State of Charge",
+        val: `${(a.soc * 100).toFixed(0)}% · ${a.discharge_mw.toFixed(1)} MW`,
+      };
+    }
+    if (a.kind === "supply") {
+      return {
+        label: "Verified / Nominal",
+        val: `${Math.round(a.verified_supply_mw ?? a.nominal_mw)} / ${Math.round(a.nominal_mw)} MW`,
+      };
+    }
+    return { label: "Status", val: "Active" };
+  };
 
-    // 3. Dynamic edges for live peer messages in edgeActivity that lack a base edge
-    Object.keys(edgeActivity).forEach((activePairId) => {
-      if (!edgeMap.has(activePairId)) {
-        const parts = activePairId.split("|");
-        if (parts.length === 2) {
-          edgeMap.set(activePairId, {
-            id: activePairId,
-            source: parts[0],
-            target: parts[1],
-            type: "customEdge",
-            data: { isDashed: true },
-          });
-        }
-      }
-    });
-
-    return Array.from(edgeMap.values());
-  }, [snapshot, twinGraph, edgeActivity]);
+  const activeRound = snapshot?.last_negotiation?.rounds ?? snapshot?.negotiation_count ?? 0;
 
   return (
-    <div className="w-full h-[460px] bg-surface rounded-panel border border-border relative overflow-hidden select-none">
-      <div className="absolute top-3 left-4 z-10 flex items-center gap-4 text-11 text-muted">
-        <div className="flex items-center gap-1.5">
-          <span className="w-2.5 h-0.5 bg-muted/60" />
-          <span>Hub Edge</span>
+    <div className="w-full bg-surface rounded-panel border border-border relative overflow-hidden select-none shadow-sm">
+      {/* Top Topology Controls / Legend Header */}
+      <div className="px-5 py-3 border-b border-border bg-surface-2/40 flex flex-wrap items-center justify-between gap-4 text-11 text-muted">
+        <div className="flex items-center gap-2">
+          <Layers className="w-4 h-4 text-accent" />
+          <span className="font-semibold uppercase tracking-wider text-text">
+            Agent Communication & Negotiation Topology
+          </span>
+          <span className="text-border">|</span>
+          <span>Click any node to view telemetry & controls</span>
         </div>
-        <div className="flex items-center gap-1.5">
-          <span className="w-2.5 h-0.5 border-b border-dashed border-muted/60" />
-          <span>Dependency / Isolated</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <span className="w-2 h-2 rounded-full bg-accent" />
-          <span>Live Message Pulse</span>
+
+        {/* Legend */}
+        <div className="flex items-center gap-5">
+          <div className="flex items-center gap-1.5">
+            <span className="w-4 h-0.5 bg-muted/70" />
+            <span>Negotiation Protocol</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="w-4 border-t border-dashed border-muted/80" />
+            <span>Dependency Flow</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="w-2.5 h-2.5 rounded-full bg-accent animate-pulse" />
+            <span className="text-text font-medium">Live Message Packet</span>
+          </div>
         </div>
       </div>
 
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        nodeTypes={nodeTypes}
-        edgeTypes={edgeTypes}
-        nodesDraggable={false}
-        nodesConnectable={false}
-        elementsSelectable={false}
-        panOnDrag={false}
-        zoomOnScroll={false}
-        preventScrolling={false}
-        fitView
-        fitViewOptions={{ padding: 0.2 }}
-        proOptions={{ hideAttribution: true }}
-      />
+      {/* Main Graph Viewport */}
+      <div className="relative w-full h-[540px] bg-bg/40">
+        {/* SVG Network Layer: Lines and Moving Communication Particles */}
+        <svg
+          viewBox="0 0 1000 600"
+          className="absolute inset-0 w-full h-full pointer-events-none"
+          preserveAspectRatio="none"
+        >
+          <defs>
+            <radialGradient id="hub-ambient-glow" cx="50%" cy="50%" r="50%">
+              <stop offset="0%" stopColor="#E5484D" stopOpacity="0.16" />
+              <stop offset="60%" stopColor="#E5484D" stopOpacity="0.04" />
+              <stop offset="100%" stopColor="#E5484D" stopOpacity="0" />
+            </radialGradient>
+
+            <filter id="particle-glow" x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="blur" />
+              <feMerge>
+                <feMergeNode in="blur" />
+                <feMergeNode in="SourceGraphic" />
+              </feMerge>
+            </filter>
+          </defs>
+
+          {/* Central Hub Ambient Aura */}
+          <circle cx={cx} cy={cy} r={140} fill="url(#hub-ambient-glow)" />
+
+          {/* Concentric Architectural Rings */}
+          <circle
+            cx={cx}
+            cy={cy}
+            r={210}
+            fill="none"
+            stroke="#26262B"
+            strokeWidth="1"
+            strokeDasharray="4 6"
+            opacity="0.5"
+          />
+
+          {/* 1. PEER DEPENDENCY EDGES */}
+          {peerEdges.map((e) => (
+            <g key={e.id}>
+              <path
+                d={e.path}
+                fill="none"
+                stroke={e.isLit ? "#E5484D" : e.isHovered ? "#A1A1AA" : "#3F3F46"}
+                strokeWidth={e.isLit ? 2.5 : 1.5}
+                strokeDasharray="4 4"
+                opacity={e.isLit ? 1 : 0.6}
+                className="transition-colors duration-200"
+              />
+
+              {/* Moving Communication Dot along dependency */}
+              <circle r={e.isLit ? 4.5 : 3} fill={e.isLit ? "#E5484D" : "#38BDF8"}>
+                <animateMotion
+                  dur={`${e.duration}s`}
+                  repeatCount="indefinite"
+                  path={e.path}
+                />
+              </circle>
+            </g>
+          ))}
+
+          {/* 2. HUB COMMUNICATION SPOKES */}
+          {hubEdges.map((e) => {
+            const strokeColor = e.isLit
+              ? "#E5484D"
+              : e.isHovered
+              ? "#E4E4E7"
+              : "#3F3F46";
+            const strokeWidth = e.isLit ? 3 : e.isHovered ? 2 : 1.5;
+
+            return (
+              <g key={e.id}>
+                {/* Communication Line */}
+                <path
+                  d={e.path}
+                  fill="none"
+                  stroke={strokeColor}
+                  strokeWidth={strokeWidth}
+                  className="transition-colors duration-200"
+                />
+
+                {/* Moving Dot: Agent -> Hub */}
+                <circle
+                  r={e.isLit ? 5 : 3.5}
+                  fill={e.isLit ? "#E5484D" : "#E4E4E7"}
+                  filter={e.isLit ? "url(#particle-glow)" : undefined}
+                >
+                  <animateMotion
+                    dur={`${e.duration}s`}
+                    repeatCount="indefinite"
+                    path={e.path}
+                  />
+                </circle>
+
+                {/* Counter-flow Dot: Hub -> Agent */}
+                <circle
+                  r={2.5}
+                  fill={e.isLit ? "#E5484D" : "#A1A1AA"}
+                  opacity="0.75"
+                >
+                  <animateMotion
+                    dur={`${e.duration * 1.3}s`}
+                    repeatCount="indefinite"
+                    path={e.reversePath}
+                  />
+                </circle>
+              </g>
+            );
+          })}
+        </svg>
+
+        {/* Central Hub Node (HTML Overlay) */}
+        <div
+          style={{ left: "50%", top: "50%", transform: "translate(-50%, -50%)" }}
+          onMouseEnter={() => setHoveredNode(HUB_NODE_ID)}
+          onMouseLeave={() => setHoveredNode(null)}
+          className="absolute z-20 w-[180px] p-3 rounded-panel bg-surface border border-accent/40 shadow-xl flex flex-col items-center justify-center text-center select-none backdrop-blur-md hover:border-accent hover:shadow-accent/10 transition-all cursor-default"
+        >
+          <div className="flex items-center gap-1.5 text-accent font-semibold text-12 mb-0.5">
+            <Scale size={15} strokeWidth={2} />
+            <span className="tracking-wide text-text uppercase text-11">
+              Consensus Hub
+            </span>
+          </div>
+          <div className="text-11 text-muted font-medium">
+            Multi-Agent Protocol
+          </div>
+          <div className="mt-1 px-2 py-0.5 rounded bg-surface-2 border border-border text-10 font-mono text-text flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-ok animate-pulse" />
+            <span>Round {activeRound} Active</span>
+          </div>
+        </div>
+
+        {/* 6 Radial Agent Cards (HTML Overlay with clean typography) */}
+        {agentCoords.map((coord) => {
+          const meta = AGENTS[coord.id];
+          const aView = snapshot?.agents?.find((a: AgentView) => a.agent_id === coord.id);
+          const status = aView?.status ?? "online";
+          const isIsolated = status === "isolated";
+          const isDisconnected = status === "disconnected";
+          const isDimmed = isIsolated || isDisconnected;
+          const highlight = getAgentHighlight(coord.id);
+          const metric = getAgentMetric(coord.id);
+
+          let borderClass = "border-border bg-surface/95";
+          if (highlight.isRequesting) {
+            borderClass = "border-accent bg-accent-dim ring-2 ring-accent";
+          } else if (highlight.isSupplyFlash) {
+            borderClass = "border-white bg-surface ring-2 ring-white/60";
+          } else if (hoveredNode === coord.id) {
+            borderClass = "border-accent/70 bg-surface shadow-md";
+          }
+
+          const statusDotColor =
+            status === "online"
+              ? "bg-ok"
+              : status === "isolated"
+              ? "bg-accent"
+              : "bg-muted";
+
+          return (
+            <div
+              key={coord.id}
+              style={{
+                left: `${coord.pctX}%`,
+                top: `${coord.pctY}%`,
+                transform: "translate(-50%, -50%)",
+              }}
+              onClick={() => setSelectedAgent(coord.id)}
+              onMouseEnter={() => setHoveredNode(coord.id)}
+              onMouseLeave={() => setHoveredNode(null)}
+              role="button"
+              tabIndex={0}
+              className={`absolute z-20 w-[196px] p-2.5 rounded-panel border text-left cursor-pointer select-none transition-all duration-150 shadow-md flex flex-col justify-between backdrop-blur-md hover:scale-[1.03] hover:shadow-lg ${borderClass} ${
+                isDimmed ? "opacity-50" : ""
+              }`}
+            >
+              {/* Header: Agent Icon + Full Name + Status Dot */}
+              <div className="flex items-center justify-between gap-1.5 mb-1">
+                <div className="flex items-center gap-2 min-w-0">
+                  <div className="p-1 rounded bg-surface-2 border border-border shrink-0">
+                    {renderIcon(coord.id)}
+                  </div>
+                  <span className="text-12 font-semibold text-text truncate">
+                    {meta?.name ?? coord.id}
+                  </span>
+                </div>
+                <span
+                  className={`w-2 h-2 rounded-full shrink-0 ${statusDotColor} ${
+                    status === "online" ? "shadow-xs" : ""
+                  }`}
+                  title={`Status: ${status}`}
+                />
+              </div>
+
+              {/* Middle: Full Role Specification (clean text sitting comfortably) */}
+              <div className="text-11 text-muted truncate mb-1.5 pl-0.5">
+                {meta?.role ?? "Utility Agent"}
+              </div>
+
+              {/* Bottom: Live Telemetry Metric Row */}
+              <div className="flex items-center justify-between text-10 pt-1.5 border-t border-border/70 text-muted">
+                <span className="truncate">{metric.label}</span>
+                <span className="text-text font-semibold font-mono text-10 shrink-0 ml-1">
+                  {metric.val}
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

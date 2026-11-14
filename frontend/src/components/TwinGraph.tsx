@@ -4,6 +4,7 @@ import ReactFlow, {
   type Edge,
   Background,
   BackgroundVariant,
+  Controls,
 } from "reactflow";
 import "reactflow/dist/style.css";
 import { TwinNodeComponent, type TwinNodeData } from "@/components/TwinNodeComponent";
@@ -18,19 +19,42 @@ const edgeTypes = {
   twinEdge: TwinEdgeComponent,
 };
 
-// Fixed, carefully structured coordinates for the 4-column municipal grid flow
+/**
+ * Clean, non-overlapping 4-stage municipal infrastructure topology.
+ *
+ * Stage 1: Generation & Storage (Grid & Battery)
+ * Stage 2: City Power Bus (Transmission Backbone)
+ * Stage 3: Municipal Utilities (Water & Telecom feed Hospital & Emergency)
+ * Stage 4: Critical Lifeline Services (ICU, Water Supply, Comms Dispatch, Firefighting)
+ *
+ * Every single edge flows cleanly from left to right with zero backward loops or node overlaps.
+ */
 const NODE_COORDINATES: Record<string, { x: number; y: number }> = {
-  grid_agent: { x: 30, y: 65 },
-  battery_agent: { x: 30, y: 235 },
-  power_bus: { x: 260, y: 150 },
-  hospital_agent: { x: 485, y: 25 },
-  water_agent: { x: 485, y: 120 },
-  telecom_agent: { x: 485, y: 215 },
-  emergency_agent: { x: 485, y: 310 },
-  icu: { x: 740, y: 25 },
-  hospital_water: { x: 740, y: 120 },
-  firefighting: { x: 740, y: 215 },
-  dispatch: { x: 740, y: 310 },
+  // Column 1: Generation & Storage
+  grid_agent: { x: 30, y: 70 },
+  battery_agent: { x: 30, y: 270 },
+
+  // Column 2: Grid Distribution Bus
+  power_bus: { x: 235, y: 170 },
+
+  // Column 3: Municipal Utilities
+  // Water and Telecom supply resources & telemetry to Hospital and Emergency
+  water_agent: { x: 440, y: 80 },
+  telecom_agent: { x: 440, y: 260 },
+  hospital_agent: { x: 645, y: 20 },
+  emergency_agent: { x: 645, y: 320 },
+
+  // Column 4: Critical Lifeline Services (backend IDs: svc_*)
+  svc_icu: { x: 860, y: 20 },
+  svc_hospital_water: { x: 860, y: 120 },
+  svc_dispatch: { x: 860, y: 220 },
+  svc_firefighting: { x: 860, y: 320 },
+
+  // Fallback aliases for resilience
+  icu: { x: 860, y: 20 },
+  hospital_water: { x: 860, y: 120 },
+  dispatch: { x: 860, y: 220 },
+  firefighting: { x: 860, y: 320 },
 };
 
 interface Props {
@@ -169,23 +193,27 @@ export function TwinGraph({ graph, activeCascade, onClearCascadeTrace }: Props) 
       </div>
 
       {/* Flow Canvas */}
-      <div className="h-[430px] w-full relative">
+      <div className="h-[480px] w-full relative">
         <ReactFlow
           nodes={nodes}
           edges={edges}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
           fitView
-          fitViewOptions={{ padding: 0.15 }}
-          nodesDraggable={false}
+          fitViewOptions={{ padding: 0.12 }}
+          nodesDraggable={true}
           nodesConnectable={false}
-          elementsSelectable={false}
-          zoomOnScroll={false}
-          panOnDrag={false}
+          elementsSelectable={true}
+          zoomOnScroll={true}
+          panOnDrag={true}
           preventScrolling={false}
           proOptions={{ hideAttribution: true }}
         >
-          <Background color="#17171A" gap={16} variant={BackgroundVariant.Dots} />
+          <Background color="#1C1C21" gap={16} variant={BackgroundVariant.Dots} />
+          <Controls
+            showInteractive={false}
+            className="!bg-surface !border !border-border !rounded-control !shadow-md [&>button]:!bg-surface-2 [&>button]:!border-border [&>button]:!text-text [&>button:hover]:!bg-border"
+          />
         </ReactFlow>
       </div>
 
@@ -195,11 +223,11 @@ export function TwinGraph({ graph, activeCascade, onClearCascadeTrace }: Props) 
           <span className="font-medium text-text">Edge Semantics:</span>
           <div className="flex items-center gap-1.5">
             <span className="w-5 h-0.5 bg-text inline-block" />
-            <span>Power (MW Scaled)</span>
+            <span>Power Flow</span>
           </div>
           <div className="flex items-center gap-1.5">
             <span className="w-5 border-t border-dashed border-muted inline-block" />
-            <span>Dependency</span>
+            <span>Operational Dependency</span>
           </div>
           <div className="flex items-center gap-1.5">
             <span className="w-5 border-t border-[#52525B] inline-block" />
@@ -226,4 +254,3 @@ export function TwinGraph({ graph, activeCascade, onClearCascadeTrace }: Props) 
     </div>
   );
 }
-

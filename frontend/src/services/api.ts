@@ -1,4 +1,5 @@
 import { ApiError } from "@/lib/errors";
+import { useAuthStore } from "@/store/useAuthStore";
 import type {
   AgentDetail,
   AgentId,
@@ -26,10 +27,20 @@ import type {
   ValidationResult,
 } from "@/types/api";
 
+/**
+ * Inject the Authorization: Bearer <token> header when a token is configured.
+ * The backend authenticates every mutating endpoint via bearer-token role check.
+ * Read-only (viewer) routes are public when VIEWER_AUTH_TOKEN is unset (the default).
+ */
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body !== undefined && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
+  }
+  // Attach bearer token from the auth store
+  const token = useAuthStore.getState().token;
+  if (token && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${token}`);
   }
   const res = await fetch(path, { ...init, headers });
   if (!res.ok) {
@@ -182,10 +193,10 @@ export const api = {
       request<Record<string, unknown>>(`/api/commander/agents/${agentId}/restore`, {
         method: "POST",
       }),
-    override: (allocation: Record<ConsumerId, number>, reason: string, authorization: string) =>
+    override: (allocation: Record<ConsumerId, number>, reason: string) =>
       request<Record<string, unknown>>("/api/commander/override", {
         method: "POST",
-        ...jsonBody({ allocation, reason, authorization }),
+        ...jsonBody({ allocation, reason }),
       }),
     acknowledgeAlert: (alertId: string) =>
       request<Alert>(`/api/commander/alerts/${alertId}/acknowledge`, { method: "POST" }),

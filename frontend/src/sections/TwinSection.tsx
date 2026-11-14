@@ -129,7 +129,7 @@ export function TwinSection() {
 
       {/* Main Grid: Twin Graph + Cascade Chains */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
-        <div className="lg:col-span-8 min-h-[480px]">
+        <div className="lg:col-span-8 min-h-[540px]">
           <TwinGraph
             graph={graph}
             activeCascade={activeCascade}
@@ -137,7 +137,7 @@ export function TwinSection() {
           />
         </div>
 
-        <div className="lg:col-span-4 min-h-[480px]">
+        <div className="lg:col-span-4 min-h-[540px]">
           <CascadeList
             cascades={cascades}
             activeCascadeIndex={activeCascadeIndex}

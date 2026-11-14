@@ -460,6 +460,7 @@ export interface HealthResponse {
   llm: Record<string, unknown>;
   simulation_status: string;
   session_id: string;
+  run_id: string;
 }
 
 export type WsEventType =

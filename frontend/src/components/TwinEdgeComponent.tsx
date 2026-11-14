@@ -34,24 +34,24 @@ export const TwinEdgeComponent = memo(function TwinEdgeComponent({
   const mw = data?.mw;
   const isHighlighted = data?.isHighlighted || data?.active_cascade;
 
-  let strokeColor = "#26262B"; // default border
-  let strokeWidth = 1;
+  let strokeColor = "#3F3F46";
+  let strokeWidth = 1.5;
   let strokeDasharray: string | undefined = undefined;
 
   if (kind === "power") {
-    // Solid, scaled from data.mw, clamped 1-6px
+    // Solid line, scaled with power MW
     const powerMw = mw ?? 0;
-    // Base formula: 1px minimum, scaling smoothly with MW capacity (e.g. 50 MW = 4px, 100 MW = 6px)
-    strokeWidth = Math.min(6, Math.max(1, 1 + Math.round((powerMw / 25) * 1.5)));
-    strokeColor = isHighlighted ? "#E5484D" : powerMw > 0 ? "#F4F4F5" : "#8B8B94";
+    strokeWidth = Math.min(5, Math.max(1.5, 1.5 + Math.round((powerMw / 30) * 1.5)));
+    strokeColor = isHighlighted ? "#E5484D" : powerMw > 0 ? "#E4E4E7" : "#52525B";
   } else if (kind === "dependency") {
-    // Dashed edge
+    // Elegant dashed dependency link
     strokeWidth = 1.5;
-    strokeDasharray = "4 4";
-    strokeColor = isHighlighted ? "#E5484D" : "#8B8B94";
+    strokeDasharray = "5 5";
+    strokeColor = isHighlighted ? "#E5484D" : "#71717A";
   } else if (kind === "service") {
-    // Thin grey service lifeline edge
-    strokeWidth = 1;
+    // Subtle service lifeline link
+    strokeWidth = 1.5;
+    strokeDasharray = "2 3";
     strokeColor = isHighlighted ? "#E5484D" : "#52525B";
   }
 
@@ -59,7 +59,7 @@ export const TwinEdgeComponent = memo(function TwinEdgeComponent({
     <>
       <path
         id={id}
-        className="react-flow__edge-path transition-colors duration-200"
+        className="react-flow__edge-path transition-all duration-200"
         d={edgePath}
         markerEnd={markerEnd}
         style={{
@@ -70,35 +70,42 @@ export const TwinEdgeComponent = memo(function TwinEdgeComponent({
         }}
       />
 
-      {/* Edge label for power with MW or coupling info if significant */}
-      {kind === "power" && mw !== undefined && mw > 0 && (
+      {/* Floating MW Badge only on primary power lines carrying active load */}
+      {kind === "power" && mw !== undefined && mw >= 10 && (
         <foreignObject
-          width={64}
-          height={20}
-          x={labelX - 32}
-          y={labelY - 10}
-          className="pointer-events-none"
+          width={56}
+          height={18}
+          x={labelX - 28}
+          y={labelY - 9}
+          className="pointer-events-none select-none"
           requiredExtensions="http://www.w3.org/1999/xhtml"
         >
           <div className="flex items-center justify-center h-full">
-            <span className="text-10 font-medium tabular-nums bg-surface-2/90 border border-border px-1 rounded text-muted">
+            <span
+              className={`text-10 font-semibold tabular-nums px-1.5 py-0.2 rounded border shadow-xs ${
+                isHighlighted
+                  ? "bg-accent text-white border-accent"
+                  : "bg-surface border-border text-text/90"
+              }`}
+            >
               {mw.toFixed(0)} MW
             </span>
           </div>
         </foreignObject>
       )}
 
-      {kind === "dependency" && data?.coupling !== undefined && (
+      {/* Subtle coupling badge for critical dependencies */}
+      {kind === "dependency" && isHighlighted && data?.coupling !== undefined && (
         <foreignObject
-          width={48}
-          height={18}
-          x={labelX - 24}
-          y={labelY - 9}
-          className="pointer-events-none"
+          width={44}
+          height={16}
+          x={labelX - 22}
+          y={labelY - 8}
+          className="pointer-events-none select-none"
           requiredExtensions="http://www.w3.org/1999/xhtml"
         >
           <div className="flex items-center justify-center h-full">
-            <span className="text-10 tabular-nums bg-surface-2/90 border border-border px-1 rounded text-muted">
+            <span className="text-9 font-medium tabular-nums bg-accent-dim border border-accent/40 text-accent px-1 rounded">
               k={data.coupling}
             </span>
           </div>
@@ -107,4 +114,3 @@ export const TwinEdgeComponent = memo(function TwinEdgeComponent({
     </>
   );
 });
-

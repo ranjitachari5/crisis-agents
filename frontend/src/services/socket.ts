@@ -1,4 +1,5 @@
 import { BACKOFF_INITIAL_MS, BACKOFF_MAX_MS, PING_INTERVAL_MS } from "@/lib/constants";
+import { useAuthStore } from "@/store/useAuthStore";
 import type { ConnectionState, WsEnvelope, WsSnapshotData } from "@/types/api";
 
 export type SocketEventHandler = {
@@ -55,6 +56,16 @@ export class SimulationSocketService {
     this.ws.onopen = () => {
       this.reconnectAttempts = 0;
       this.startPing();
+
+      // Send auth frame if a token is configured.
+      // Backend expects {"type": "auth", "token": "<token>"} as the first frame
+      // when VIEWER_AUTH_TOKEN is set. When viewer routes are public (default dev
+      // mode), the server accepts connections without auth, but sending auth with
+      // a valid commander/admin token still works and returns auth_ok.
+      const token = useAuthStore.getState().token;
+      if (token) {
+        this.send({ type: "auth", token });
+      }
 
       if (this.lastEventSeq > 0) {
         // Reconnected: request missed events from last seq
