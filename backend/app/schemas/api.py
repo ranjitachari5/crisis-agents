@@ -13,7 +13,10 @@ ConsumerId = Literal["hospital_agent", "water_agent", "telecom_agent", "emergenc
 AgentId = Literal["hospital_agent", "water_agent", "telecom_agent", "emergency_agent", "battery_agent", "grid_agent"]
 FakeKind = Literal["false_capacity_drop", "fake_disaster_alert", "inflated_bid", "replay_message",
                    "false_recovery", "contradictory_sensors"]
-Mode = Literal["negotiation", "centralized", "fixed_priority", "fcfs"]
+Mode = Literal["negotiation", "centralized", "fixed_priority", "fcfs", "rolling_horizon", "hidden_information",
+               "no_trust", "fallback_only", "negotiation_only"]
+MAX_PARAMS = 16
+DEFAULT_MODES: tuple[Mode, ...] = ("fcfs", "fixed_priority", "centralized", "negotiation")
 
 
 class Strict(BaseModel):
@@ -35,31 +38,54 @@ class FairnessRequest(Strict):
 
 class SettingsRequest(Strict):
     approval_mode: Literal["auto", "manual"] | None = None
+    approval_timeout_s: float | None = Field(default=None, ge=0, le=3600, description="0 disables expiry")
+    approval_timeout_policy: Literal["keep_last", "commit"] | None = None
     tick_interval_s: float | None = Field(default=None, ge=0.5, le=60)
+
+
+def _check_params(v: dict[str, Any]) -> dict[str, Any]:
+    if len(v) > MAX_PARAMS:
+        raise ValueError(f"at most {MAX_PARAMS} params")
+    for k, x in v.items():
+        if len(str(k)) > 40 or not isinstance(x, (str, int, float, bool)) or (isinstance(x, str) and len(x) > 100):
+            raise ValueError("params must be short scalars")
+        if isinstance(x, float) and not math.isfinite(x):
+            raise ValueError("params must be finite")
+    return v
 
 
 class EventInjectRequest(Strict):
     event_type: EventType
     params: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("params")
+    @classmethod
+    def _params(cls, v):
+        return _check_params(v)
+
 
 class FakeInjectRequest(Strict):
     kind: FakeKind = "false_capacity_drop"
     params: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("params")
+    @classmethod
+    def _params(cls, v):
+        return _check_params(v)
 
 
 def _check_alloc(v: dict[str, float] | None) -> dict[str, float] | None:
     if v is None:
         return v
     for k, x in v.items():
-        if not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0 or x > 10_000:
+        if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0 or x > 10_000:
             raise ValueError(f"allocation for {k} must be a finite number in [0, 10000]")
     return v
 
 
 class ValidateRequest(Strict):
     allocation: dict[ConsumerId, float] | None = None
-    proposal_id: str | None = None
+    proposal_id: str | None = Field(default=None, min_length=4, max_length=64)
 
     @field_validator("allocation")
     @classmethod
@@ -89,7 +115,6 @@ class NegotiationStartRequest(Strict):
 class OverrideRequest(Strict):
     allocation: dict[ConsumerId, float]
     reason: str = Field(min_length=5, max_length=300)
-    authorization: str = Field(min_length=1, max_length=200, description="COMMANDER_AUTH_TOKEN")
 
     @field_validator("allocation")
     @classmethod
@@ -115,8 +140,24 @@ class EvaluationRequest(Strict):
     scenario: ScenarioName = "flood_cascade"
     seed: int = Field(default=42, ge=0, le=2**31 - 1)
     ticks: int = Field(default=32, ge=4, le=200)
+    seeds: list[int] | None = Field(default=None, min_length=1, max_length=10,
+                                    description="multi-seed sweep; overrides 'seed' and adds mean/std/95% CI")
     fairness: float = Field(default=0.5, ge=0, le=1)
-    modes: list[Mode] = Field(default_factory=lambda: ["fcfs", "fixed_priority", "centralized", "negotiation"])
+    modes: list[Mode] = Field(default_factory=lambda: list(DEFAULT_MODES),
+                              min_length=1, max_length=9)
+    adversarial: bool = Field(default=False, description="one consumer over-reports demand by 50%")
+
+    @field_validator("seeds")
+    @classmethod
+    def _seeds(cls, v):
+        if v is not None and any(s < 0 or s > 2**31 - 1 for s in v):
+            raise ValueError("seeds must be in [0, 2^31-1]")
+        return v
+
+
+class CreateRunRequest(Strict):
+    scenario: ScenarioName = "grid_shortage"
+    seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
 
 
 class HealthResponse(BaseModel):
@@ -126,6 +167,7 @@ class HealthResponse(BaseModel):
     llm: dict
     simulation_status: str
     session_id: str
+    run_id: str
 
 
 class ErrorBody(BaseModel):

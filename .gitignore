@@ -26,3 +26,9 @@ dist/
 Thumbs.db
 .vscode/
 .idea/
+
+# Test / tooling artefacts
+.coverage
+.hypothesis/
+.mypy_cache/
+.ruff_cache/

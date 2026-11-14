@@ -5,6 +5,7 @@ Every chat line shown in the UI is one of these objects. Natural-language
 """
 from __future__ import annotations
 
+import json
 import math
 import uuid
 from datetime import datetime, timezone
@@ -48,11 +49,10 @@ class MessageStatus(str, Enum):
     SUPERSEDED = "superseded"
 
 
-# Fields covered by the HMAC signature (status/seq change after sending).
-SIGNED_FIELDS = {
-    "message_id", "round_id", "negotiation_id", "tick", "sender", "receiver",
-    "message_type", "resource", "quantity", "unit", "reason", "sim_time", "data",
-}
+# Every field is covered by the Ed25519 signature except these, which change after
+# sending (delivery sequence, status, the signature itself, verification outcome).
+UNSIGNED_FIELDS = {"seq", "status", "signature", "trust"}
+MAX_DATA_BYTES = 8192
 
 
 def new_id(prefix: str) -> str:
@@ -79,14 +79,16 @@ class AgentMessage(BaseModel):
     unit: str | None = "MW"
     reason: str | None = Field(default=None, max_length=500)
     text: str = Field(default="", max_length=2000)
-    mentions: list[str] = Field(default_factory=list)
-    in_reply_to: str | None = None
-    proposal_id: str | None = None
+    mentions: list[str] = Field(default_factory=list, max_length=10)
+    in_reply_to: str | None = Field(default=None, max_length=64)
+    proposal_id: str | None = Field(default=None, max_length=64)
     data: dict[str, Any] = Field(default_factory=dict)
     timestamp: datetime = Field(default_factory=utcnow)
     sim_time: datetime
+    kid: str | None = Field(default=None, max_length=80)          # signing key id
+    agent_seq: int | None = Field(default=None, ge=0)              # per-agent monotonic counter
     status: MessageStatus = MessageStatus.DELIVERED
-    signature: str | None = None
+    signature: str | None = Field(default=None, max_length=256)
     trust: dict[str, Any] | None = None  # verification outcome (not signed)
 
     @field_validator("quantity")
@@ -94,9 +96,16 @@ class AgentMessage(BaseModel):
     def _finite_quantity(cls, v: float | None) -> float | None:
         if v is None:
             return v
-        if not math.isfinite(v) or v < 0 or v > 100_000:
+        if isinstance(v, bool) or not math.isfinite(v) or v < 0 or v > 100_000:
             raise ValueError("quantity must be finite and within [0, 100000]")
         return round(float(v), 3)
 
+    @field_validator("data")
+    @classmethod
+    def _bounded_data(cls, v: dict[str, Any]) -> dict[str, Any]:
+        if len(json.dumps(v, default=str)) > MAX_DATA_BYTES:
+            raise ValueError(f"data payload exceeds {MAX_DATA_BYTES} bytes")
+        return v
+
     def signing_payload(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", include=SIGNED_FIELDS)
+        return self.model_dump(mode="json", exclude=UNSIGNED_FIELDS)

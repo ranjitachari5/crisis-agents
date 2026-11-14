@@ -43,6 +43,10 @@ class NegotiationInput:
     battery: BatteryAgent | None
     trigger: str
     max_rounds: int
+    upper_caps: dict[str, float] | None = None   # per-agent ceiling this interval (nameplate + ramp limit)
+    warm_start: dict[str, float] | None = None   # previous committed allocation (optimizer warm start)
+    fallback_only: bool = False                  # evaluation ablation: skip negotiation rounds
+    negotiation_only: bool = False               # evaluation ablation: no optimizer fallback
 
 
 @dataclass
@@ -58,6 +62,9 @@ class NegotiationResult:
     final_positions: dict[str, float]
     position_messages: dict[str, str] = field(default_factory=dict)
     timeline: list[dict] = field(default_factory=list)
+    outcome: str = "converged"        # uncontested | converged | fallback | degraded | unconverged
+    ramp_limited: list[str] = field(default_factory=list)
+    solver: dict | None = None
 
     def summary(self) -> dict:
         return {
@@ -68,6 +75,9 @@ class NegotiationResult:
             "converged": self.converged,
             "fallback_used": self.fallback_used,
             "degradation": self.degradation,
+            "outcome": self.outcome,
+            "ramp_limited": self.ramp_limited,
+            "solver": self.solver,
             "latency_ms": round(self.latency_ms, 2),
             "demands": self.demands,
             "final_positions": self.final_positions,
@@ -88,24 +98,34 @@ class NegotiationProtocol:
         self.submit = submit      # agent message -> trust-verified + published; returns accepted
         self.post = post          # system message -> published
         self.mediator = mediator
+        self._solver: dict | None = None
 
     # -- helpers -----------------------------------------------------------
     @staticmethod
     def problem(est: dict[str, Estimate], supply: float, fairness: float,
-                lower_bounds: dict[str, float] | None = None) -> AllocationProblem:
+                lower_bounds: dict[str, float] | None = None, caps: dict[str, float] | None = None,
+                warm_start: dict[str, float] | None = None) -> AllocationProblem:
         ids = list(est)
         crit = critical_weights()
+        caps = caps or {}
         return AllocationProblem(
             agent_ids=ids,
             demand={i: est[i].demand for i in ids},
             min_safe={i: est[i].min_safe for i in ids},
-            max_allowed={i: CONSUMER_PROFILES[i].max_allowed for i in ids},
+            max_allowed={i: min(CONSUMER_PROFILES[i].max_allowed, caps.get(i, float("inf"))) for i in ids},
             damage_weight={i: est[i].urgency for i in ids},
             critical_weight={i: crit[i] for i in ids},
             supply=supply,
             fairness=fairness,
             lower_bounds=lower_bounds,
+            warm_start=warm_start,
         )
+
+    def _solve(self, inp: NegotiationInput, est: dict[str, Estimate], supply: float,
+               lower_bounds: dict[str, float] | None = None) -> dict[str, float]:
+        sol = solve(self.problem(est, supply, inp.fairness, lower_bounds, inp.upper_caps, inp.warm_start))
+        self._solver = sol.info.to_dict() if sol.info else None
+        return sol.allocation
 
     @staticmethod
     def concession_shares(gap: float, est: dict[str, Estimate], bids: dict[str, float],
@@ -126,6 +146,7 @@ class NegotiationProtocol:
     # -- main --------------------------------------------------------------
     def run(self, inp: NegotiationInput) -> NegotiationResult:
         t0 = time.perf_counter()
+        self._solver = None
         nid = new_id("neg")
         ctx = MessageContext(inp.tick, inp.sim_time, nid, 0)
         P = self.mediator
@@ -241,8 +262,7 @@ class NegotiationProtocol:
                                     f"{supply:.1f} MW is verified. Minimising weighted harm; unavoidable "
                                     f"shortages will be reported.", quantity=supply,
                                     data={"total_min": total_m, "supply": supply}))
-                sol = solve(self.problem(est, supply, inp.fairness))
-                candidate = sol.allocation
+                candidate = self._solve(inp, est, supply)
                 for ag in inp.active:
                     a = candidate[ag.agent_id]
                     if a < est[ag.agent_id].min_safe - 1e-3:
@@ -250,6 +270,13 @@ class NegotiationProtocol:
                                                ag.say_shortfall(a, est[ag.agent_id].min_safe), quantity=a,
                                                reason="unavoidable shortfall",
                                                data={"shortfall": round(est[ag.agent_id].min_safe - a, 3)}))
+            elif total_d > supply + TOL and inp.fallback_only:
+                # Evaluation ablation: no negotiation rounds, go straight to the optimizer.
+                fallback, converged, method = True, False, "fallback"
+                self.post(P.message(ctx, MessageType.SYSTEM,
+                                    "Ablation 'fallback_only': skipping negotiation rounds; applying the "
+                                    "constrained optimizer directly.", resource=None))
+                candidate = self._solve(inp, est, supply)
             elif total_d > supply + TOL:
                 # Steps 5-6: bounded rounds of offers, counteroffers and concessions
                 method = "negotiation"
@@ -316,13 +343,18 @@ class NegotiationProtocol:
                         break
                 if converged:
                     surplus = supply - sum(bids.values())
-                    candidate = (solve(self.problem(est, supply, inp.fairness, lower_bounds=bids)).allocation
+                    candidate = (self._solve(inp, est, supply, lower_bounds=bids)
                                  if surplus > TOL else dict(bids))
                     self.post(P.message(ctx, MessageType.SYSTEM,
                                         f"Agents converged in round {rounds}. Positions sum to "
                                         f"{sum(bids.values()):.1f} MW of {supply:.1f} MW"
                                         + (f"; redistributing {surplus:.1f} MW surplus." if surplus > TOL else "."),
                                         data={"positions": bids}))
+                elif inp.negotiation_only:
+                    # Evaluation ablation: no optimizer fallback. The unconverged positions go to the
+                    # validator as-is (and are rejected if they exceed supply).
+                    method = "negotiation_unconverged"
+                    candidate = dict(bids)
                 else:
                     fallback, method = True, "fallback"
                     gap = sum(bids.values()) - supply
@@ -330,10 +362,21 @@ class NegotiationProtocol:
                                         f"No agreement after {inp.max_rounds} rounds (gap {gap:.1f} MW). Applying "
                                         f"deterministic emergency fallback policy (constrained optimizer, "
                                         f"f={inp.fairness:.2f}).", quantity=gap, data={"positions": bids}))
-                    candidate = solve(self.problem(est, supply, inp.fairness)).allocation
+                    candidate = self._solve(inp, est, supply)
             else:
                 candidate = dict(demand)
 
+        # Ramp limits: load restoration is capped per interval; the remainder follows next tick.
+        ramp_limited = []
+        if inp.upper_caps:
+            for i in list(candidate):
+                cap = inp.upper_caps.get(i)
+                if cap is None:
+                    continue
+                if candidate[i] > cap + 1e-6:
+                    candidate[i] = round(cap, 3)
+                if i in est and cap < est[i].demand - TOL:
+                    ramp_limited.append(i)
         supply_total = grid_supply + battery_offer
         allocation = {**{i: round(v, 3) for i, v in candidate.items()}, **inp.reserved}
         objective = (evaluate_objective(self.problem(est, supply_total, inp.fairness),
@@ -344,6 +387,10 @@ class NegotiationProtocol:
             battery_offer=round(battery_offer, 3), negotiation_id=nid, objective=objective,
             rounds=rounds, converged=converged, tick=inp.tick,
         )
+        outcome = ("degraded" if degradation else "fallback" if fallback else
+                   "uncontested" if method == "uncontested" else "converged" if converged else "unconverged")
+        proposal.outcome = outcome
+        proposal.solver = self._solver
         alloc_txt = ", ".join(f"{i.split('_')[0]} {v:.1f}" for i, v in allocation.items())
         self.post(P.message(ctx, MessageType.PROPOSAL,
                             f"Candidate allocation {proposal.proposal_id} ({method}): {alloc_txt} MW. "
@@ -352,4 +399,5 @@ class NegotiationProtocol:
                                                                     "proposal_id": proposal.proposal_id}))
         latency = (time.perf_counter() - t0) * 1000
         return NegotiationResult(nid, proposal, rounds, converged, fallback, degradation, latency,
-                                 demand, dict(bids), positions_msg, timeline)
+                                 demand, dict(bids), positions_msg, timeline, outcome, ramp_limited,
+                                 self._solver)

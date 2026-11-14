@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.agents.base import BaseAgent
+from app.trust.crypto import SigningKey
 from app.simulation.telemetry import GRID_SENSOR_IDS
 from app.trust.consensus import ConsensusResult, sensor_consensus
 
@@ -26,15 +27,22 @@ class GridAgent(BaseAgent):
     """Publishes verified supply. Has NO authority to allocate power."""
     agent_id = "grid_agent"
     RESERVE_MARGIN_FRAC = 0.005
+    MAX_STEP_FRAC = 0.15       # largest per-assessment supply change a mere majority may assert
+    PLAUSIBLE_MAX_FRAC = 1.10  # readings above 110 % of nominal are physically implausible
 
-    def __init__(self, secret: bytes, nominal_capacity: float):
-        super().__init__(secret)
+    def __init__(self, key: SigningKey, nominal_capacity: float):
+        super().__init__(key)
         self.nominal = nominal_capacity
         self.last_reported: float | None = None
+        self.last_accepted: float | None = None   # last non-ambiguous consensus estimate
 
-    def assess(self, override: float | None = None) -> GridAssessment:
+    def assess(self, override: float | None = None, weights: list[float] | None = None) -> GridAssessment:
         assert self.observation is not None
-        cons = sensor_consensus(self.observation.grid_sensors)
+        cons = sensor_consensus(self.observation.grid_sensors, weights,
+                                bounds=(0.0, self.nominal * self.PLAUSIBLE_MAX_FRAC),
+                                previous=self.last_accepted, max_step=self.nominal * self.MAX_STEP_FRAC)
+        if cons.median is not None:
+            self.last_accepted = cons.median
         if override is not None:
             margin = max(0.5, override * self.RESERVE_MARGIN_FRAC)
             return GridAssessment(cons, round(override - margin, 3), override, margin, self.nominal, True)
@@ -46,7 +54,10 @@ class GridAgent(BaseAgent):
     def describe(self, a: GridAssessment) -> str:
         if not a.ok:
             readings = ", ".join(f"{s}={v:.1f}" for s, v in zip(GRID_SENSOR_IDS, self.observation.grid_sensors))
-            return f"Sensor disagreement — cannot verify supply ({readings}). Escalating to commander."
+            why = ("a large supply change is backed by only a sensor majority while the dissenting sensor "
+                   "still reads the previous value (possible correlated fault)"
+                   if a.consensus.reason == "UNCORROBORATED_STEP" else "sensor disagreement")
+            return f"Cannot verify supply: {why} ({readings}). Escalating to commander."
         drop = (1 - a.raw_value / self.nominal) * 100 if self.nominal else 0
         parts = []
         if drop > 1:
@@ -66,8 +77,8 @@ class GridAgent(BaseAgent):
 class BatteryAgent(BaseAgent):
     agent_id = "battery_agent"
 
-    def __init__(self, secret: bytes, dt_hours: float):
-        super().__init__(secret)
+    def __init__(self, key: SigningKey, dt_hours: float):
+        super().__init__(key)
         self.dt_hours = dt_hours
 
     def capability(self) -> float:

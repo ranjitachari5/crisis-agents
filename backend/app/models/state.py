@@ -28,20 +28,34 @@ class ConsumerProfile:
     concession_rate: float  # fraction of flexible demand released per round
     peer_grant_fraction: float  # how generously it answers peer requests
     dependencies: dict[str, float] = field(default_factory=dict)  # upstream -> coupling
+    ramp_up_mw_per_min: float = 2.0  # max load-restoration rate (decreases/shedding are instantaneous)
+    feeder: str = ""                 # distribution feeder in the digital twin
 
 
 CONSUMER_PROFILES: dict[str, ConsumerProfile] = {
     "hospital_agent": ConsumerProfile(
         "hospital_agent", "Hospital Agent", 100, 85, 130, 10, 100, 0.34, 0.5,
-        {"water_agent": 0.35, "telecom_agent": 0.15}),
+        {"water_agent": 0.35, "telecom_agent": 0.15}, ramp_up_mw_per_min=3.0, feeder="feeder_north"),
     "water_agent": ConsumerProfile(
-        "water_agent", "Water Agent", 70, 55, 90, 6, 60, 0.30, 1.0, {}),
+        "water_agent", "Water Agent", 70, 55, 90, 6, 60, 0.30, 1.0, {},
+        ramp_up_mw_per_min=2.0, feeder="feeder_south"),
     "telecom_agent": ConsumerProfile(
-        "telecom_agent", "Telecom Agent", 50, 30, 60, 7, 70, 0.50, 1.0, {}),
+        "telecom_agent", "Telecom Agent", 50, 30, 60, 7, 70, 0.50, 1.0, {},
+        ramp_up_mw_per_min=2.0, feeder="feeder_south"),
     "emergency_agent": ConsumerProfile(
         "emergency_agent", "Emergency Services Agent", 60, 35, 80, 8, 80, 0.30, 0.5,
-        {"water_agent": 0.30, "telecom_agent": 0.35}),
+        {"water_agent": 0.30, "telecom_agent": 0.35}, ramp_up_mw_per_min=2.5, feeder="feeder_north"),
 }
+
+# Distribution feeders of the digital twin (rated thermal capacity, MW).
+FEEDER_CAPACITY_MW: dict[str, float] = {"feeder_north": 210.0, "feeder_south": 150.0}
+
+
+def feeders() -> dict[str, tuple[list[str], float]]:
+    out: dict[str, tuple[list[str], float]] = {}
+    for fid, cap in FEEDER_CAPACITY_MW.items():
+        out[fid] = ([a for a, p in CONSUMER_PROFILES.items() if p.feeder == fid], cap)
+    return out
 
 
 @dataclass

@@ -8,11 +8,13 @@ propagates to hospital water availability and firefighting capacity.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from app.models.state import CONSUMER_PROFILES, CityState
 
 ORDER = ("water_agent", "telecom_agent", "hospital_agent", "emergency_agent")  # topological
 
-DERIVED_SERVICES = {
+DERIVED_SERVICES: dict[str, dict[str, Any]] = {
     "svc_icu": {"label": "ICU life support", "inputs": {"hospital_agent": 1.0}},
     "svc_hospital_water": {"label": "Hospital water availability", "inputs": {"water_agent": 1.0}},
     "svc_firefighting": {"label": "Firefighting capacity", "inputs": {"water_agent": 0.5, "emergency_agent": 0.5}},

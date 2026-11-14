@@ -13,6 +13,8 @@ import numpy as np
 from app.models.state import CityState
 
 GRID_SENSOR_IDS = ("scada_substation_a", "scada_substation_b", "pmu_feeder_c")
+# Measurement technology per sensor: corroboration must span different types (F5).
+SENSOR_TYPES = {"scada_substation_a": "scada", "scada_substation_b": "scada", "pmu_feeder_c": "pmu"}
 
 
 @dataclass

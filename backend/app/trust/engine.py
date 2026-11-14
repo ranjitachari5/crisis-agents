@@ -1,9 +1,10 @@
 """Crisis Trust Engine.
 
 Deterministic verification of every message before it can influence the
-negotiation: authentication, schema, freshness/replay, telemetry comparison,
-independent corroboration and consistency/authority checks. Unverified
-claims are quarantined and can never directly change a committed allocation.
+negotiation: Ed25519 authentication, schema, freshness/replay/sequence,
+telemetry comparison, independent cross-type corroboration and
+consistency/authority checks. Unverified claims are quarantined and can never
+directly change a committed allocation.
 """
 from __future__ import annotations
 
@@ -11,13 +12,15 @@ from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
+from typing import Callable
 
 from pydantic import ValidationError
 
 from app.schemas.messages import AgentMessage, MessageType, new_id, utcnow
-from app.simulation.telemetry import GRID_SENSOR_IDS, TelemetrySnapshot
+from app.simulation.telemetry import GRID_SENSOR_IDS, SENSOR_TYPES, TelemetrySnapshot
 from app.trust import crypto
 from app.trust.consensus import ConsensusResult, sensor_consensus, tolerance
+from app.trust.crypto import PublicKeyRegistry
 
 CONSUMERS = {"hospital_agent", "water_agent", "telecom_agent", "emergency_agent"}
 # Who is authoritative for which kind of claim.
@@ -27,6 +30,13 @@ AUTHORITY = {
     "disaster_alert": {"simulation", "commander"},
 }
 HIGH_IMPACT_FRACTION = 0.2
+MIN_CORROBORATING_TYPES = 2
+SEEN_CACHE_MAX = 20_000
+HARD_FAIL = {"source_authentication", "schema_validation", "unique_message_id", "timestamp_freshness",
+             "wallclock_freshness", "sequence_monotonic", "sender_not_isolated"}
+
+# (agent_id, message_id) -> True if newly recorded, False if already seen (durable store, F4)
+ReplayStore = Callable[[str, str], bool]
 
 
 class TrustDecision(str, Enum):
@@ -95,30 +105,62 @@ class TrustContext:
     dt_minutes: int
     isolated: set[str]
     last_grid_report: float | None
+    consensus: ConsensusResult | None = None   # the engine's current grid assessment, if available
 
 
 class TrustEngine:
-    def __init__(self, keyring: dict[str, bytes]):
-        self.keyring = keyring
-        self.seen: OrderedDict[str, datetime] = OrderedDict()
-        self.reputation: dict[str, float] = {a: 1.0 for a in keyring}
+    def __init__(self, public_keys: PublicKeyRegistry, replay_store: ReplayStore | None = None,
+                 max_age_s: float = 300.0, clock_skew_s: float = 30.0):
+        self.keys = public_keys
+        self.replay_store = replay_store
+        self.max_age_s = max_age_s
+        self.clock_skew_s = clock_skew_s
+        self.seen: OrderedDict[tuple[str, str], datetime] = OrderedDict()   # TTL cache in front of the store
+        self.last_seq: dict[str, int] = {}
+        self.reputation: dict[str, float] = {a: 1.0 for a in public_keys.participants()}
+        self.sensor_reputation: dict[str, float] = {s: 1.0 for s in GRID_SENSOR_IDS}
         self.incidents: list[TrustIncident] = []
         self.quarantine: list[dict] = []
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ replay
+    def _prune_seen(self, now: datetime, ttl: timedelta) -> None:
+        # Entries older than the freshness window + skew can no longer pass the freshness check.
+        while self.seen:
+            key, t = next(iter(self.seen.items()))
+            if now - t > ttl or len(self.seen) > SEEN_CACHE_MAX:
+                self.seen.popitem(last=False)
+            else:
+                break
+
+    def _is_duplicate(self, msg: AgentMessage) -> bool:
+        return (msg.sender, msg.message_id) in self.seen
+
+    def _record(self, msg: AgentMessage) -> bool:
+        """Record an authenticated message id. Returns False if the durable store has seen it."""
+        self.seen[(msg.sender, msg.message_id)] = msg.sim_time
+        if self.replay_store is not None:
+            return self.replay_store(msg.sender, msg.message_id)
+        return True
+
+    # ------------------------------------------------------------------ verify
     def verify(self, msg: AgentMessage, ctx: TrustContext) -> VerificationResult:
         ev: list[Evidence] = []
         tel = ctx.telemetry
 
-        # 1. authenticate source
-        key = self.keyring.get(msg.sender)
-        auth_ok = crypto.verify(msg.signing_payload(), msg.signature, key)
-        if key is None:
+        # 1. authenticate source (Ed25519, public keys only)
+        known = msg.sender in self.keys or msg.sender in self.reputation
+        public_key = self.keys.public_key(msg.sender, msg.kid) if known else None
+        auth_ok = public_key is not None and crypto.verify(msg.signing_payload(), msg.signature, public_key)
+        if not known:
             detail = f"sender '{msg.sender}' is not a registered participant"
+        elif self.keys.is_revoked(msg.kid):
+            detail = f"key {msg.kid} for '{msg.sender}' has been revoked"
+        elif public_key is None:
+            detail = f"unknown key id {msg.kid!r} for '{msg.sender}'"
         elif not auth_ok:
-            detail = f"HMAC signature invalid for '{msg.sender}' (possible identity spoofing)"
+            detail = f"Ed25519 signature invalid for '{msg.sender}' (tampering or identity spoofing)"
         else:
-            detail = f"HMAC-SHA256 signature valid for '{msg.sender}'"
+            detail = f"Ed25519 signature valid for '{msg.sender}' (kid {msg.kid})"
         ev.append(Evidence("source_authentication", auth_ok, detail))
         if msg.sender in ctx.isolated:
             ev.append(Evidence("sender_not_isolated", False, f"'{msg.sender}' has been isolated by the commander"))
@@ -136,26 +178,45 @@ class TrustEngine:
             struct_ok, sdetail = False, f"schema invalid: {exc.errors()[0]['msg']}"
         ev.append(Evidence("schema_validation", struct_ok, sdetail))
 
-        # 3. timestamps and unique ids (replay protection)
+        # 3. freshness (sim time and wall clock), unique ids, per-agent sequence (replay protection)
         window = timedelta(minutes=ctx.dt_minutes)
-        duplicate = msg.message_id in self.seen
+        self._prune_seen(ctx.sim_time, window * 2)
+        duplicate = self._is_duplicate(msg)
         age = ctx.sim_time - msg.sim_time
-        fresh = (-window <= age <= window)
+        fresh = -window <= age <= window
+        wall_age = (utcnow() - msg.timestamp).total_seconds()
+        wall_fresh = -self.clock_skew_s <= wall_age <= self.max_age_s
+        seq_ok, seq_detail = True, "sequence not tracked"
+        if auth_ok:
+            last = self.last_seq.get(msg.sender, 0)
+            if msg.agent_seq is None:
+                seq_ok, seq_detail = False, "authenticated message carries no agent sequence number"
+            elif msg.agent_seq <= last:
+                seq_ok, seq_detail = False, f"sequence {msg.agent_seq} <= last seen {last} (replay or reordering)"
+            else:
+                gap = msg.agent_seq - last - 1
+                seq_detail = f"sequence {msg.agent_seq} > {last}" + (f" ({gap} message(s) not seen)" if gap else "")
+            if not duplicate and fresh and wall_fresh and seq_ok:
+                if not self._record(msg):
+                    duplicate = True  # durable store has it: replay across a restart
         ev.append(Evidence("unique_message_id", not duplicate,
                            "message id already processed (replay)" if duplicate else "message id is new"))
         ev.append(Evidence("timestamp_freshness", fresh,
                            f"message sim-time {msg.sim_time.isoformat()} vs now {ctx.sim_time.isoformat()} "
                            f"(age {age.total_seconds()/60:.0f} min, window ±{ctx.dt_minutes} min)"))
-        if not duplicate:
-            self.seen[msg.message_id] = msg.sim_time
-            while len(self.seen) > 20000:
-                self.seen.popitem(last=False)
+        ev.append(Evidence("wallclock_freshness", wall_fresh,
+                           f"sent {wall_age:.1f} s ago (allowed -{self.clock_skew_s:.0f} s .. {self.max_age_s:.0f} s)"))
+        if auth_ok:
+            ev.append(Evidence("sequence_monotonic", seq_ok, seq_detail))
+            if seq_ok and not duplicate:
+                self.last_seq[msg.sender] = msg.agent_seq or 0
 
         # 4-6. content checks against trusted telemetry
         telemetry_contradicted = False
         telemetry_unavailable = False
         high_impact = False
-        cons = sensor_consensus(tel.grid_sensors)
+        uncorroborated_claim = False
+        cons = ctx.consensus or sensor_consensus(tel.grid_sensors, self.sensor_weights())
         claim_type = msg.data.get("claim_type")
         if msg.message_type == MessageType.SUPPLY_REPORT and claim_type is None:
             claim_type = "grid_capacity"
@@ -181,12 +242,16 @@ class TrustEngine:
                                q, tel.battery_max_discharge_mw))
             telemetry_contradicted = not ok
         elif claim_type in ("grid_capacity", "recovery") and claimed is not None:
-            claimed = float(claimed)
-            if cons.median is None:
+            try:
+                claimed = float(claimed)
+            except (TypeError, ValueError):
+                claimed = float("nan")
+            if claimed != claimed or cons.median is None:  # NaN claim or no trusted reference
                 telemetry_unavailable = True
                 ev.append(Evidence("telemetry_comparison", False,
-                                   "grid sensors disagree; no trusted reference available",
-                                   claimed, None))
+                                   "no trusted reference available "
+                                   f"({cons.reason.lower().replace('_', ' ') if cons.median is None else 'invalid claim'})",
+                                   None if claimed != claimed else claimed, None))
             else:
                 tol = tolerance(cons.median)
                 ok = abs(claimed - cons.median) <= tol
@@ -195,14 +260,22 @@ class TrustEngine:
                                    f"(tolerance ±{tol:.1f})", claimed, cons.median))
                 telemetry_contradicted = not ok
                 high_impact = abs(claimed - cons.median) > HIGH_IMPACT_FRACTION * max(cons.median, 1.0)
-            corroborating = [GRID_SENSOR_IDS[i] for i, r in enumerate(tel.grid_sensors)
-                             if abs(r - claimed) <= tolerance(r)]
-            if ctx.last_grid_report is not None and msg.sender != "grid_agent" and \
+            # Corroboration must come from independent source *types* (SCADA, PMU, grid agent report),
+            # so two co-located sensors of the same type cannot carry a supply cut or a recovery alone.
+            sources = [GRID_SENSOR_IDS[i] for i, r in enumerate(tel.grid_sensors)
+                       if claimed == claimed and abs(r - claimed) <= tolerance(r)]
+            types = {SENSOR_TYPES[s] for s in sources}
+            if ctx.last_grid_report is not None and msg.sender != "grid_agent" and claimed == claimed and \
                     abs(ctx.last_grid_report - claimed) <= tolerance(ctx.last_grid_report) + 2:
-                corroborating.append("grid_agent_report")
-            ev.append(Evidence("independent_corroboration", len(corroborating) >= 2,
-                               f"{len(corroborating)} independent source(s) agree: {corroborating or 'none'}",
-                               len(corroborating), ">=2"))
+                sources.append("grid_agent_report")
+                types.add("grid_agent")
+            corroborated = len(types) >= MIN_CORROBORATING_TYPES
+            ev.append(Evidence("independent_corroboration", corroborated,
+                               f"{len(types)} independent source type(s) agree: "
+                               f"{sorted(types) or 'none'} via {sources or 'none'}", len(types),
+                               f">={MIN_CORROBORATING_TYPES}"))
+            # Routine grid supply reports restate the consensus; explicit claims must be corroborated.
+            uncorroborated_claim = msg.message_type == MessageType.CLAIM and not corroborated
             authorised = msg.sender in AUTHORITY[claim_type]
             ev.append(Evidence("source_authority", authorised,
                                f"'{msg.sender}' {'is' if authorised else 'is NOT'} authoritative for {claim_type}"))
@@ -230,16 +303,14 @@ class TrustEngine:
                                "hazard sensors corroborate" if ok else "no independent sensor corroborates the alert"))
 
         # decision (deterministic rules)
-        hard_fail = {"source_authentication", "schema_validation", "unique_message_id",
-                     "timestamp_freshness", "sender_not_isolated"}
         failed = [e.check for e in ev if not e.passed]
-        if any(f in hard_fail for f in failed):
+        if any(f in HARD_FAIL for f in failed):
             decision = TrustDecision.REJECTED
         elif telemetry_contradicted:
             decision = TrustDecision.QUARANTINED
         elif telemetry_unavailable and high_impact:
             decision = TrustDecision.ESCALATED
-        elif telemetry_unavailable:
+        elif telemetry_unavailable or uncorroborated_claim:
             decision = TrustDecision.QUARANTINED
         else:
             decision = TrustDecision.ACCEPTED
@@ -247,17 +318,28 @@ class TrustEngine:
         summary = (f"{decision.value.upper()}: " +
                    ("all checks passed" if not failed else "failed " + ", ".join(failed)))
 
-        # reputation: only penalise authenticated senders (spoofed identities are not their fault)
-        if auth_ok and not duplicate and fresh and msg.sender in self.reputation:
+        # reputation: only penalise authenticated, fresh, in-sequence senders (spoofs are not their fault)
+        if auth_ok and not duplicate and fresh and wall_fresh and seq_ok and msg.sender in self.reputation:
             if decision in (TrustDecision.QUARANTINED, TrustDecision.REJECTED):
                 self.reputation[msg.sender] = round(max(0.0, self.reputation[msg.sender] - 0.25), 3)
             elif decision == TrustDecision.ACCEPTED:
                 self.reputation[msg.sender] = round(min(1.0, self.reputation[msg.sender] + 0.01), 3)
         return VerificationResult(decision, score, ev, summary)
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ sensors
+    def sensor_weights(self) -> list[float]:
+        return [self.sensor_reputation[s] for s in GRID_SENSOR_IDS]
+
+    def update_sensor_reputation(self, cons: ConsensusResult) -> None:
+        """Decay sensors that are repeatedly outvoted; slowly restore the ones that agree."""
+        if cons.status == "ambiguous":
+            return
+        for i, sid in enumerate(GRID_SENSOR_IDS):
+            r = self.sensor_reputation[sid]
+            self.sensor_reputation[sid] = round(min(1.0, r + 0.02) if i in cons.agreeing else max(0.1, r - 0.1), 3)
+
     def assess_sensors(self, tel: TelemetrySnapshot) -> ConsensusResult:
-        return sensor_consensus(tel.grid_sensors)
+        return sensor_consensus(tel.grid_sensors, self.sensor_weights())
 
     def open_incident(self, kind: str, msg: AgentMessage, res: VerificationResult, tick: int,
                       version: int) -> TrustIncident:
@@ -280,6 +362,8 @@ class TrustEngine:
         self.incidents.append(inc)
         if inc.quarantined:
             self.quarantine.append({"incident_id": inc.incident_id, "message": msg.model_dump(mode="json")})
+            self.quarantine = self.quarantine[-1000:]
+        self.incidents = self.incidents[-2000:]
         return inc
 
     def get_incident(self, incident_id: str) -> TrustIncident | None:
