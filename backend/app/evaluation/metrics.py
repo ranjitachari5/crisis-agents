@@ -1,6 +1,7 @@
 """Per-tick performance metrics (measured, never invented)."""
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
@@ -28,6 +29,10 @@ class MetricsTracker:
     ticks: list[TickMetrics] = field(default_factory=list)
     negotiation_latency_ms: list[float] = field(default_factory=list)
     negotiation_rounds: list[int] = field(default_factory=list)
+    negotiation_messages: list[int] = field(default_factory=list)
+    outcomes: Counter = field(default_factory=Counter)        # uncontested | converged | fallback | degraded | ...
+    commit_outcomes: Counter = field(default_factory=Counter)
+    solvers: Counter = field(default_factory=Counter)
 
     def record(self, tick: int, allocation: dict[str, float], demand: dict[str, float],
                mins: dict[str, float], w: dict[str, float], c: dict[str, float], supply: float,
@@ -49,9 +54,27 @@ class MetricsTracker:
         self.ticks = self.ticks[-5000:]
         return tm
 
-    def record_negotiation(self, latency_ms: float, rounds: int) -> None:
+    def record_negotiation(self, latency_ms: float, rounds: int, outcome: str = "converged", messages: int = 0,
+                           solver: str | None = None) -> None:
         self.negotiation_latency_ms.append(latency_ms)
         self.negotiation_rounds.append(rounds)
+        self.negotiation_messages.append(messages)
+        self.outcomes[outcome] += 1
+        if solver:
+            self.solvers[solver] += 1
+
+    def record_commit(self, outcome: str) -> None:
+        self.commit_outcomes[outcome or "unknown"] += 1
+
+    def outcome_rates(self) -> dict:
+        """Share of negotiations decided by the agents vs the deterministic fallback (F10)."""
+        n = sum(self.outcomes.values())
+        contested = n - self.outcomes.get("uncontested", 0)
+        rate = (lambda k: round(self.outcomes.get(k, 0) / contested, 4) if contested else None)
+        return {"negotiations": n, "contested": contested, "outcomes": dict(self.outcomes),
+                "convergence_rate": rate("converged"), "fallback_rate": rate("fallback"),
+                "degraded_rate": rate("degraded"), "unconverged_rate": rate("unconverged"),
+                "commit_outcomes": dict(self.commit_outcomes), "solvers": dict(self.solvers)}
 
     def recovery_episodes(self) -> list[int]:
         """Lengths (in ticks) of contiguous periods where any critical minimum was unmet."""
@@ -88,8 +111,11 @@ class MetricsTracker:
                                             if self.negotiation_latency_ms else None),
             "mean_negotiation_rounds": (round(float(np.mean(self.negotiation_rounds)), 3)
                                         if self.negotiation_rounds else None),
+            "mean_negotiation_messages": (round(float(np.mean(self.negotiation_messages)), 2)
+                                          if self.negotiation_messages else None),
             "shortfall_episodes": len(eps),
             "mean_recovery_time_min": round(float(np.mean(eps)) * minutes, 1) if eps else 0.0,
+            **{k: v for k, v in self.outcome_rates().items() if k.endswith("_rate")},
         }
 
     def series(self, last: int = 96) -> list[dict]:

@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from app.agents.base import BaseAgent
+from app.trust.crypto import SigningKey
 from app.models.state import CONSUMER_PROFILES, ConsumerProfile, ConsumerState
 
 
@@ -44,14 +45,15 @@ def dependents_weight(agent_id: str) -> float:
 
 
 class ConsumerAgent(BaseAgent):
-    def __init__(self, profile: ConsumerProfile, secret: bytes, dt_minutes: int):
-        super().__init__(secret)
+    def __init__(self, profile: ConsumerProfile, key: SigningKey, dt_minutes: int):
+        super().__init__(key)
         self.agent_id = profile.agent_id
         self.profile = profile
         self.dt_minutes = dt_minutes
         self.local: ConsumerState | None = None
         self.estimate_: Estimate | None = None
         self.stubborn = False  # set by tests/fault-injection to simulate a non-cooperative agent
+        self.inflation = 1.0   # >1 simulates a strategic agent over-reporting demand (evaluation ablations)
 
     # ---- perception --------------------------------------------------------
     def observe_local(self, local: ConsumerState) -> None:
@@ -65,7 +67,7 @@ class ConsumerAgent(BaseAgent):
         # The regulated/verified minimum is exact; the meter is noisy and never read below the minimum.
         min_safe = self.observation.consumer_mins.get(self.agent_id, self.profile.min_safe)
         demand = self.observation.consumer_meters.get(self.agent_id, self.local.effective_demand)
-        demand = min(max(demand, min_safe), self.profile.max_allowed)
+        demand = min(max(demand * self.inflation, min_safe), self.profile.max_allowed)
         urgency = self.profile.damage_weight * self.situational_multiplier() + dependents_weight(self.agent_id)
         self.estimate_ = Estimate(round(demand, 3), round(min_safe, 3), round(demand - min_safe, 3), round(urgency, 3))
         return self.estimate_

@@ -7,7 +7,7 @@ from typing import Any
 
 from app.schemas.messages import AgentMessage, MessageStatus, MessageType
 from app.simulation.telemetry import TelemetrySnapshot
-from app.trust import crypto
+from app.trust.crypto import SigningKey
 
 # Presentation metadata the frontend can use (icon names are lucide-react icons).
 AGENT_META: dict[str, dict[str, str]] = {
@@ -36,9 +36,17 @@ class MessageContext:
 class BaseAgent:
     agent_id: str = "base"
 
-    def __init__(self, secret: bytes):
-        self._secret = secret
+    def __init__(self, key: SigningKey):
+        self._key = key          # private key: stays with the agent, never given to the trust engine
+        self._agent_seq = 0      # per-agent monotonic message counter (replay / reordering detection)
         self.observation: TelemetrySnapshot | None = None
+
+    @property
+    def kid(self) -> str:
+        return self._key.kid
+
+    def rotate_key(self, key: SigningKey) -> None:
+        self._key = key
 
     @property
     def meta(self) -> dict[str, str]:
@@ -82,14 +90,20 @@ class BaseAgent:
             data=data or {},
             sim_time=ctx.sim_time,
             status=status,
+            kid=self._key.kid,
+            agent_seq=self._next_seq(),
         )
-        msg.signature = crypto.sign(msg.signing_payload(), self._secret)
+        msg.signature = self._key.sign(msg.signing_payload())
         return msg
+
+    def _next_seq(self) -> int:
+        self._agent_seq += 1
+        return self._agent_seq
 
 
 class SystemActor(BaseAgent):
     """Non-utility participants (protocol mediator, trust engine, event feed, commander)."""
 
-    def __init__(self, agent_id: str, secret: bytes):
-        super().__init__(secret)
+    def __init__(self, agent_id: str, key: SigningKey):
+        super().__init__(key)
         self.agent_id = agent_id

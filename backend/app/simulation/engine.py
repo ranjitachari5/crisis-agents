@@ -3,6 +3,7 @@ trust verification, negotiation, validation and versioned commits."""
 from __future__ import annotations
 
 import logging
+import time
 from datetime import timedelta
 from typing import Any, Callable
 
@@ -12,11 +13,14 @@ from app.agents.base import AGENT_META, MessageContext
 from app.agents.registry import AgentRegistry
 from app.config import Settings
 from app.evaluation.metrics import MetricsTracker
-from app.models.state import CONSUMER_IDS, CONSUMER_PROFILES, CityState, initial_city
-from app.negotiation.agreements import AgreementStore, AllocationProposal, CommitError, ProposalStatus
+from app.models.state import CONSUMER_IDS, CONSUMER_PROFILES, CityState, feeders, initial_city
+from app.negotiation.agreements import (CLOSED_STATES, Agreement, AgreementStore, AllocationProposal, CommitError,
+                                        ProposalStatus)
+from app.observability import (COMMITS, NEG_MESSAGES, NEG_ROUNDS, NEG_SECONDS, NEG_TOTAL, PROPOSALS_EXPIRED,
+                               SOLVER_RUNS, SOLVER_SECONDS, TRUST_DECISIONS)
 from app.negotiation.protocol import NegotiationInput, NegotiationProtocol
 from app.optimization import baselines
-from app.optimization.allocator import AllocationProblem, evaluate_objective, solve
+from app.optimization.allocator import AllocationProblem, solve
 from app.optimization.weights import critical_weights, damage_weights
 from app.schemas.messages import AgentMessage, MessageStatus, MessageType, new_id, utcnow
 from app.simulation.cascade import build_graph, compute_service_levels, derived_services, cascade_chains
@@ -28,7 +32,11 @@ from app.validation.validator import AllocationConstraints, ValidationResult, va
 
 log = logging.getLogger(__name__)
 
-ALLOCATION_MODES = ("negotiation", "centralized", "fixed_priority", "fcfs")
+ALLOCATION_MODES = ("negotiation", "centralized", "fixed_priority", "fcfs", "rolling_horizon",
+                    "hidden_information")
+FEATURE_DEFAULTS = {"trust_engine": True, "fallback_only": False, "negotiation_only": False}
+RNG_STREAMS = ("telemetry", "agents", "injector", "negotiation", "fcfs")
+ROLLING_HORIZON_TICKS = 8
 STATUS_MAP = {
     TrustDecision.ACCEPTED: MessageStatus.VERIFIED,
     TrustDecision.QUARANTINED: MessageStatus.QUARANTINED,
@@ -46,7 +54,8 @@ class EngineError(Exception):
 class SimulationEngine:
     def __init__(self, settings: Settings, *, seed: int | None = None, scenario: str = "grid_shortage",
                  emit: Callable[[str, dict], None] | None = None, repo=None,
-                 allocation_mode: str = "negotiation", max_history: int = 3000):
+                 allocation_mode: str = "negotiation", max_history: int = 3000,
+                 features: dict[str, bool] | None = None):
         if scenario not in SCENARIOS:
             raise EngineError("UNKNOWN_SCENARIO", f"unknown scenario '{scenario}'")
         if allocation_mode not in ALLOCATION_MODES:
@@ -56,15 +65,24 @@ class SimulationEngine:
         self.scenario = scenario
         self.script = {t: (e, p) for t, e, p in SCENARIOS[scenario]["script"]}
         self.allocation_mode = allocation_mode
-        self.rng = np.random.default_rng(self.seed)
-        self.order_rng = np.random.default_rng(self.seed + 1)  # FCFS arrival order (keeps telemetry noise identical)
+        unknown = set(features or {}) - set(FEATURE_DEFAULTS)
+        if unknown:
+            raise EngineError("UNKNOWN_FEATURE", f"unknown feature flags {sorted(unknown)}")
+        self.features = {**FEATURE_DEFAULTS, **(features or {})}
+        # One independent generator per component (F15): call order in one component never shifts another.
+        streams = np.random.SeedSequence(self.seed).spawn(len(RNG_STREAMS))
+        self.rngs = {name: np.random.default_rng(ss) for name, ss in zip(RNG_STREAMS, streams)}
+        self.rng = self.rngs["telemetry"]
+        self.order_rng = self.rngs["fcfs"]
         self.dt_minutes = settings.sim_minutes_per_tick
         self.dt_hours = self.dt_minutes / 60
         self.city: CityState = initial_city(SCENARIOS[scenario]["initial"])
         self.city.scenario = scenario
         self.registry = AgentRegistry(self.dt_minutes, self.city.grid.nominal_capacity)
         self.telemetry_service = TelemetryService(self.rng, self.dt_hours)
-        self.trust = TrustEngine(self.registry.keyring)
+        self.trust = TrustEngine(self.registry.public_keys,
+                                 replay_store=repo.record_message_id if repo else None,
+                                 max_age_s=settings.message_max_age_s, clock_skew_s=settings.message_clock_skew_s)
         self.agreements = AgreementStore()
         self.protocol = NegotiationProtocol(self.submit, self.publish, self.registry.system["negotiation_protocol"])
         self.metrics = MetricsTracker(self.dt_hours)
@@ -78,6 +96,8 @@ class SimulationEngine:
         self.status = "idle"
         self.fairness = 0.5
         self.approval_mode = "auto"
+        self.approval_timeout_s = settings.approval_timeout_s
+        self.approval_timeout_policy = settings.approval_timeout_policy
         self.negotiation_paused = False
         self.frozen = False
         self.messages: list[dict] = []
@@ -106,6 +126,11 @@ class SimulationEngine:
     @property
     def headless(self) -> bool:
         return self._emit is None and self.repo is None
+
+    @property
+    def observed(self) -> bool:
+        """Report to the process-wide Prometheus registry (live runs only, not evaluation engines)."""
+        return not self.headless
 
     def ctx(self, negotiation_id: str | None = None) -> MessageContext:
         return MessageContext(self.city.tick, self.city.sim_time, negotiation_id)
@@ -171,15 +196,23 @@ class SimulationEngine:
             agent.observe_local(self.city.consumers[aid])
         self.registry.grid.observe(self.telemetry)
         self.registry.battery.observe(self.telemetry)
-        self.grid_assessment = self.registry.grid.assess(self.city.grid.supply_override)
+        self.grid_assessment = self.registry.grid.assess(self.city.grid.supply_override,
+                                                         self.trust.sensor_weights())
 
     def trust_ctx(self) -> TrustContext:
         isolated = {aid for aid, c in self.city.consumers.items() if c.isolated}
         return TrustContext(self.telemetry, self.city.sim_time, self.dt_minutes, isolated,
-                            self.registry.grid.last_reported)
+                            self.registry.grid.last_reported, self.grid_assessment.consensus)
 
     def submit(self, msg: AgentMessage, kind: str | None = None) -> bool:
+        if not self.features["trust_engine"]:  # evaluation ablation: everything is accepted unverified
+            msg.trust = {"decision": "accepted", "score": None, "summary": "trust engine disabled (ablation)"}
+            msg.status = MessageStatus.DELIVERED
+            self.publish(msg)
+            return True
         res = self.trust.verify(msg, self.trust_ctx())
+        if self.observed:
+            TRUST_DECISIONS.labels(decision=res.decision.value).inc()
         msg.trust = res.brief()
         msg.status = STATUS_MAP[res.decision]
         self.publish(msg)
@@ -196,7 +229,7 @@ class SimulationEngine:
             f"{'; '.join(failed[:3]) or 'see evidence'}. "
             + ("Escalated to the human commander." if res.decision == TrustDecision.ESCALATED else
                "Quarantined: it cannot change the committed allocation."),
-            in_reply_to=msg.message_id, mentions=[msg.sender] if msg.sender in self.registry.keyring else [],
+            in_reply_to=msg.message_id, mentions=[msg.sender] if msg.sender in self.registry.participants else [],
             data={"incident_id": inc.incident_id, "decision": res.decision.value, "trust_score": res.trust_score},
             resource=None)
         inc.agent_responses.append(ta.message_id)
@@ -232,12 +265,14 @@ class SimulationEngine:
                 kind="contradictory_sensors", message_id="telemetry", sender="sensor_network",
                 claim={"readings": readings}, decision=TrustDecision.ACCEPTED.value, trust_score=0.67,
                 evidence=[{"check": "sensor_consensus", "passed": True,
-                           "detail": f"2-of-3 majority at {cons.median:.1f} MW", "observed": cons.median,
+                           "detail": f"robust consensus of {len(cons.agreeing)} sensors at {cons.median:.1f} MW",
+                           "observed": cons.median,
                            "expected": None},
                           {"check": "outlier_detection", "passed": False,
                            "detail": f"{', '.join(bad)} disagrees with majority; excluded", "observed": None,
                            "expected": None}],
-                summary=f"Faulty sensor(s) {bad} excluded by majority vote; supply verification unaffected.",
+                summary=f"Faulty sensor(s) {bad} excluded as outliers (median/MAD); supply verification "
+                        f"unaffected.",
                 tick=self.city.tick, sim_time=self.city.sim_time.isoformat(), quarantined=True, escalated=False,
                 allocation_version_before=self.agreements.version,
                 allocation_version_after=self.agreements.version, allocation_changed=False)
@@ -255,9 +290,12 @@ class SimulationEngine:
                 kind="contradictory_sensors", message_id="telemetry", sender="sensor_network",
                 claim={"readings": readings}, decision=TrustDecision.ESCALATED.value, trust_score=0.0,
                 evidence=[{"check": "sensor_consensus", "passed": False,
-                           "detail": f"no two sensors agree (spread {cons.spread:.1f} MW)", "observed": cons.spread,
-                           "expected": None}],
-                summary="Grid sensors disagree with no majority. Allocation frozen at last verified "
+                           "detail": (f"{cons.reason}: a majority asserts a large supply change while the "
+                                      f"dissenting sensor still reads the last accepted value (possible correlated "
+                                      f"fault)" if cons.reason == "UNCORROBORATED_STEP" else
+                                      f"{cons.reason}: no robust consensus (spread {cons.spread:.1f} MW)"),
+                           "observed": cons.spread, "expected": None}],
+                summary="Grid sensors cannot be reconciled. Allocation frozen at last verified "
                         "agreement; commander decision required.",
                 tick=self.city.tick, sim_time=self.city.sim_time.isoformat(), quarantined=True, escalated=True,
                 allocation_version_before=self.agreements.version)
@@ -292,6 +330,24 @@ class SimulationEngine:
     def battery_capability(self) -> float:
         return self.telemetry.battery_max_discharge_mw if self.city.battery.connected else 0.0
 
+    def ramp_limits(self) -> dict[str, float]:
+        return {a: p.ramp_up_mw_per_min * self.dt_minutes for a, p in CONSUMER_PROFILES.items()}
+
+    def previous_allocation(self) -> dict[str, float] | None:
+        cur = self.agreements.current
+        return dict(cur.allocation) if cur else None
+
+    def upper_caps(self) -> dict[str, float] | None:
+        """Per-agent ceiling for the next commit: nameplate limit and ramp limit vs the committed allocation."""
+        prev = self.previous_allocation()
+        if prev is None:
+            return None
+        ramp = self.ramp_limits()
+        tel = self.telemetry
+        # never below the safe minimum: restoring critical load is not ramp-limited
+        return {a: min(tel.consumer_max[a], max(prev[a] + ramp[a], min(tel.consumer_mins[a], tel.consumer_meters[a])))
+                for a in self.active_ids() if a in prev}
+
     def constraints(self, battery_offer: float) -> AllocationConstraints:
         reserved, _ = self.reserved()
         tel = self.telemetry
@@ -300,21 +356,33 @@ class SimulationEngine:
             grid_supply=self.grid_assessment.verified_supply or 0.0,
             battery_offer=min(battery_offer, self.battery_capability()),
             min_safe=dict(tel.consumer_mins), max_allowed=dict(tel.consumer_max),
-            demand=dict(tel.consumer_meters), active_agents=self.active_ids(), reserved=reserved)
+            demand=dict(tel.consumer_meters), active_agents=self.active_ids(), reserved=reserved,
+            previous=self.previous_allocation(), ramp_up=self.ramp_limits(), feeders=feeders(),
+            battery_usable_mwh=tel.battery_usable_mwh if self.city.battery.connected else 0.0,
+            dt_hours=self.dt_hours)
 
     def validate(self, allocation: dict[str, float], base_version: int, proposal_id: str,
                  battery_offer: float) -> ValidationResult:
         return validate_allocation(allocation, self.constraints(battery_offer), base_version, proposal_id,
                                    self.agreements.committed_ids)
 
-    def central_problem(self, supply: float) -> AllocationProblem:
+    def central_problem(self, supply: float, reported: bool = False, respect_ramp: bool = True) -> AllocationProblem:
+        """``reported=True``: the planner only sees what agents report (hidden-information baseline)."""
         tel = self.telemetry
         ids = self.active_ids()
         w, c = damage_weights(self.city), critical_weights()
-        return AllocationProblem(ids, {i: tel.consumer_meters[i] for i in ids},
-                                 {i: min(tel.consumer_mins[i], tel.consumer_meters[i]) for i in ids},
-                                 {i: tel.consumer_max[i] for i in ids}, {i: w[i] for i in ids},
-                                 {i: c[i] for i in ids}, supply, self.fairness)
+        caps = (self.upper_caps() or {}) if respect_ramp else {}
+        if reported:
+            est = {i: self.registry.consumers[i].estimate() for i in ids}
+            demand = {i: est[i].demand for i in ids}
+            mins = {i: min(est[i].min_safe, est[i].demand) for i in ids}
+        else:
+            demand = {i: tel.consumer_meters[i] for i in ids}
+            mins = {i: min(tel.consumer_mins[i], tel.consumer_meters[i]) for i in ids}
+        return AllocationProblem(ids, demand, mins,
+                                 {i: min(tel.consumer_max[i], caps.get(i, float("inf"))) for i in ids},
+                                 {i: w[i] for i in ids}, {i: c[i] for i in ids}, supply, self.fairness,
+                                 warm_start=self.previous_allocation())
 
     # ---------------------------------------------------------- negotiation
     def renegotiation_reason(self) -> str | None:
@@ -333,6 +401,8 @@ class SimulationEngine:
                 return f"{aid} demand changed {b['demands'].get(aid, 0):.0f} → {c.effective_demand:.0f} MW"
         if set(self.active_ids()) != b["active"]:
             return "agent connectivity changed"
+        if b.get("ramp_limited"):
+            return "ramp-limited load restoration continuing (" + ", ".join(b["ramp_limited"]) + ")"
         cap = self.battery_capability()
         alloc_total = sum(self.agreements.current.allocation.values())
         required = max(0.0, alloc_total - verified)
@@ -364,17 +434,32 @@ class SimulationEngine:
             fairness=self.fairness, active=active, reserved=reserved, reserved_reason=why,
             grid_assessment=self.grid_assessment, grid=self.registry.grid,
             battery=self.registry.battery if self.city.battery.connected else None,
-            trigger=trigger, max_rounds=self.settings.max_negotiation_rounds)
+            trigger=trigger, max_rounds=self.settings.max_negotiation_rounds,
+            upper_caps=self.upper_caps(), warm_start=self.previous_allocation(),
+            fallback_only=self.features["fallback_only"], negotiation_only=self.features["negotiation_only"])
+        seq0 = self._seq
         result = self.protocol.run(inp)
-        self.metrics.record_negotiation(result.latency_ms, result.rounds)
+        n_messages = self._seq - seq0
+        self.metrics.record_negotiation(result.latency_ms, result.rounds, result.outcome, n_messages,
+                                        (result.solver or {}).get("solver"))
+        if self.observed:
+            NEG_TOTAL.labels(outcome=result.outcome).inc()
+            NEG_ROUNDS.observe(result.rounds)
+            NEG_MESSAGES.observe(n_messages)
+            NEG_SECONDS.observe(result.latency_ms / 1000)
+            if result.solver:
+                SOLVER_RUNS.labels(solver=result.solver["solver"], status=result.solver["status"]).inc()
+                SOLVER_SECONDS.observe(result.solver["solve_ms"] / 1000)
         self.agreements.register(result.proposal)
         self._basis = {"supply": self.grid_assessment.verified_supply, "tick": self.city.tick,
                        "demands": {a: c.effective_demand for a, c in self.city.consumers.items()},
-                       "active": set(self.active_ids()), "battery_cap": self.battery_capability()}
+                       "active": set(self.active_ids()), "battery_cap": self.battery_capability(),
+                       "ramp_limited": result.ramp_limited}
         summary = result.summary()
+        summary["messages"] = n_messages
         self.audit("negotiation", "negotiation_protocol", "negotiation_completed",
                    {k: summary[k] for k in ("negotiation_id", "proposal_id", "method", "rounds", "converged",
-                                            "fallback_used", "degradation", "latency_ms")})
+                                            "fallback_used", "degradation", "latency_ms", "outcome", "messages")})
         outcome = self.process_proposal(result.proposal, "negotiation_protocol", result.position_messages)
         summary["outcome"] = outcome
         self.negotiations.append(summary)
@@ -404,15 +489,23 @@ class SimulationEngine:
             proposal.status = ProposalStatus.REJECTED
             self.audit("agreement", "validator", "proposal_rejected",
                        {"proposal_id": proposal.proposal_id, "violations": v.to_dict()["violations"]})
-            if committed_by == "negotiation_protocol":
+            if committed_by == "negotiation_protocol" and not self.features["negotiation_only"]:
                 return self._safety_fallback(f"validation failed for {proposal.proposal_id}")
+            if committed_by == "negotiation_protocol":
+                self._retain_last_valid(f"validation failed for {proposal.proposal_id} (no fallback: ablation)")
             return {"committed": False, "validation": v.to_dict()}
         proposal.status = ProposalStatus.VALIDATED
         current_ok = self._current_feasible()
         if allow_pending and self.approval_mode == "manual" and committed_by == "negotiation_protocol" and current_ok:
+            proposal.awaiting_since = time.monotonic()
+            for pid in self.agreements.supersede_awaiting(proposal):
+                self.audit("agreement", "agreement_store", "proposal_superseded",
+                           {"proposal_id": pid, "superseded_by": proposal.proposal_id})
             self.system_msg("negotiation_protocol", MessageType.SYSTEM,
                             f"Proposal {proposal.proposal_id} validated. Awaiting commander approval "
-                            f"(manual approval mode). Current allocation v{self.agreements.version} stays in force.",
+                            f"(manual approval mode). Current allocation v{self.agreements.version} stays in force"
+                            + (f"; expires in {self.approval_timeout_s:.0f} s "
+                               f"(policy: {self.approval_timeout_policy})." if self.approval_timeout_s > 0 else "."),
                             negotiation_id=nid, proposal_id=proposal.proposal_id, resource=None)
             self.alert("info", "Proposal awaiting approval", proposal.proposal_id, "negotiation_protocol")
             return {"committed": False, "pending_approval": True, "validation": v.to_dict()}
@@ -428,8 +521,14 @@ class SimulationEngine:
 
     def commit(self, proposal: AllocationProposal, v: ValidationResult, committed_by: str,
                position_messages: dict[str, str] | None = None) -> dict:
+        persist = None
+        if self.repo:
+            def persist(ag: Agreement, base: int) -> str:
+                return self.repo.commit_agreement(self.session_id, base, {**ag.to_dict(), "committed_by": committed_by})
+        if not proposal.outcome:
+            proposal.outcome = "override" if proposal.method == "commander_override" else proposal.method
         try:
-            agreement, new = self.agreements.commit(proposal, v, committed_by, self.city.tick)
+            agreement, new = self.agreements.commit(proposal, v, committed_by, self.city.tick, persist)
         except CommitError as exc:
             self.audit("agreement", committed_by, "commit_rejected", {"proposal_id": proposal.proposal_id,
                                                                        "code": exc.code, "reason": str(exc)})
@@ -453,10 +552,11 @@ class SimulationEngine:
             self.set_status(mid, MessageStatus.ACCEPTED)
         d = agreement.to_dict()
         self.audit("agreement", committed_by, f"committed_v{agreement.version}",
-                   {"proposal_id": proposal.proposal_id, "method": agreement.method,
+                   {"proposal_id": proposal.proposal_id, "method": agreement.method, "outcome": agreement.outcome,
                     "allocation": agreement.allocation, "degradation_mode": agreement.degradation_mode})
-        if self.repo:
-            self.repo.save_agreement(self.session_id, d)
+        if self.observed:
+            COMMITS.labels(outcome=agreement.outcome or "unknown").inc()
+        self.metrics.record_commit(agreement.outcome)
         if agreement.degradation_mode:
             self.alert("critical", "Emergency degradation mode",
                        "Unavoidable shortages: " + ", ".join(f"{k} −{s:.1f} MW"
@@ -480,19 +580,38 @@ class SimulationEngine:
         alloc = {**sol.allocation, **reserved}
         prop = AllocationProposal(allocation=alloc, base_version=self.agreements.version, method=method,
                                   supply_total=verified + cap, grid_supply=verified, battery_offer=cap,
-                                  objective=sol.objective, tick=self.city.tick, notes=[reason])
+                                  objective=sol.objective, tick=self.city.tick, notes=[reason], outcome="fallback",
+                                  solver=sol.info.to_dict() if sol.info else None)
         self.agreements.register(prop)
         self.system_msg("negotiation_protocol", MessageType.EMERGENCY_WARNING,
                         f"Deterministic emergency policy engaged: {reason}.", proposal_id=prop.proposal_id,
                         resource=None)
-        return self.process_proposal(prop, "emergency_policy", allow_pending=False)
+        out = self.process_proposal(prop, "emergency_policy", allow_pending=False)
+        if not out.get("committed"):
+            self._retain_last_valid(f"emergency policy proposal {prop.proposal_id} also failed validation")
+        return out
+
+    def _retain_last_valid(self, reason: str) -> None:
+        """Last link of the fallback chain: keep the last committed (validated) allocation in force."""
+        self.audit("agreement", "emergency_policy", "last_valid_retained",
+                   {"reason": reason, "version": self.agreements.version})
+        self.system_msg("negotiation_protocol", MessageType.EMERGENCY_WARNING,
+                        f"{reason}. Keeping last valid allocation v{self.agreements.version} in force.",
+                        resource=None)
 
     def baseline_allocate(self) -> None:
         cap = self.battery_capability()
         reserved, _ = self.reserved()
         supply = max(0.0, (self.grid_assessment.verified_supply or 0.0) + cap - sum(reserved.values()))
-        p = self.central_problem(supply)
-        if self.allocation_mode == "centralized":
+        p = self.central_problem(supply, reported=self.allocation_mode == "hidden_information",
+                                 respect_ramp=False)
+        if self.allocation_mode in ("centralized", "hidden_information"):
+            alloc = baselines.centralized_optimization(p)
+        elif self.allocation_mode == "rolling_horizon":
+            # Spread usable battery energy over the planning horizon instead of draining it now.
+            budget = min(cap, self.telemetry.battery_usable_mwh / (ROLLING_HORIZON_TICKS * self.dt_hours)) \
+                if self.city.battery.connected else 0.0
+            p.supply = max(0.0, (self.grid_assessment.verified_supply or 0.0) + budget - sum(reserved.values()))
             alloc = baselines.centralized_optimization(p)
         elif self.allocation_mode == "fixed_priority":
             alloc = baselines.fixed_priority(p)
@@ -515,7 +634,8 @@ class SimulationEngine:
             return 0
         v = validate_allocation(alloc, self.constraints(self.battery_capability()), self.agreements.version,
                                 "__metrics__", set())
-        safety = {"OVER_CAPACITY", "BELOW_MIN_SAFE", "ABOVE_MAX", "BATTERY_LIMIT", "INVALID_VALUE"}
+        safety = {"OVER_CAPACITY", "BELOW_MIN_SAFE", "ABOVE_MAX", "BATTERY_LIMIT", "BATTERY_SOC", "FEEDER_CAP",
+                  "NON_NUMERIC", "NON_FINITE_OR_NEGATIVE"}
         return sum(1 for x in v.violations if x.code in safety)
 
     def advance_physics(self) -> None:
@@ -604,6 +724,7 @@ class SimulationEngine:
             etype, params = self.script[self.city.tick]
             self.inject_event(etype, dict(params), actor="scenario", renegotiate=False)
         self.refresh_telemetry()
+        self.trust.update_sensor_reputation(self.grid_assessment.consensus)
         self.check_sensors()
         if self.allocation_mode == "negotiation":
             reason = self.renegotiation_reason()
@@ -669,8 +790,11 @@ class SimulationEngine:
                 self.city.grid.sensor_faults = {2: round(avail * 0.2, 1)}
             elif mode == "split":
                 self.city.grid.sensor_faults = {1: round(avail * 0.6, 1), 2: round(avail * 0.2, 1)}
+            elif mode == "correlated":
+                # Two co-located/spoofed sensors agree on a fabricated supply cut.
+                self.city.grid.sensor_faults = {0: round(avail * 0.3, 1), 1: round(avail * 0.3, 1)}
             else:
-                raise EngineError("INVALID_PARAMS", "mode must be 'single' or 'split'", 422)
+                raise EngineError("INVALID_PARAMS", "mode must be 'single', 'split' or 'correlated'", 422)
             self.refresh_telemetry()
             self.check_sensors()
             inc = next((i for i in reversed(self.trust.incidents) if i.kind == "contradictory_sensors"), None)
@@ -731,12 +855,57 @@ class SimulationEngine:
                 self._force_reason = "fairness policy changed"
         return {"fairness": self.fairness, "negotiation": result}
 
-    def set_approval_mode(self, mode: str, actor: str = "commander") -> dict:
+    def set_approval_mode(self, mode: str, actor: str = "commander", timeout_s: float | None = None,
+                          policy: str | None = None) -> dict:
         if mode not in ("auto", "manual"):
             raise EngineError("INVALID_MODE", "approval mode must be auto or manual", 422)
+        if policy is not None and policy not in ("keep_last", "commit"):
+            raise EngineError("INVALID_POLICY", "approval timeout policy must be keep_last or commit", 422)
         self.approval_mode = mode
-        self.audit("commander", actor, "set_approval_mode", {"mode": mode})
-        return {"approval_mode": mode}
+        if timeout_s is not None:
+            self.approval_timeout_s = float(timeout_s)
+        if policy is not None:
+            self.approval_timeout_policy = policy
+        self.audit("commander", actor, "set_approval_mode",
+                   {"mode": mode, "timeout_s": self.approval_timeout_s, "policy": self.approval_timeout_policy})
+        return {"approval_mode": mode, "approval_timeout_s": self.approval_timeout_s,
+                "approval_timeout_policy": self.approval_timeout_policy}
+
+    def expire_pending(self, now: float | None = None) -> list[dict]:
+        """Approval timeout (F11): an unattended proposal never stalls allocation indefinitely."""
+        if self.approval_timeout_s <= 0:
+            return []
+        now = time.monotonic() if now is None else now
+        out = []
+        for p in self.agreements.awaiting_approval():
+            if now - (p.awaiting_since or now) < self.approval_timeout_s:
+                continue
+            policy = self.approval_timeout_policy
+            p.awaiting_since = None
+            committed = False
+            if policy == "commit":
+                v = self.validate(p.allocation, p.base_version, p.proposal_id, p.battery_offer)
+                if v.valid:
+                    p.status = ProposalStatus.APPROVED
+                    self.audit("agreement", "approval_timeout", "proposal_auto_committed",
+                               {"proposal_id": p.proposal_id, "policy": policy, "timeout_s": self.approval_timeout_s})
+                    self.commit(p, v, "approval_timeout")
+                    committed = True
+            if not committed:
+                p.status = ProposalStatus.EXPIRED
+                self.audit("agreement", "approval_timeout", "proposal_expired",
+                           {"proposal_id": p.proposal_id, "policy": policy, "timeout_s": self.approval_timeout_s,
+                            "kept_version": self.agreements.version})
+                self.system_msg("negotiation_protocol", MessageType.SYSTEM,
+                                f"Proposal {p.proposal_id} expired after {self.approval_timeout_s:.0f} s without "
+                                f"commander approval (policy {policy}). Allocation v{self.agreements.version} "
+                                f"stays in force.", proposal_id=p.proposal_id, resource=None)
+            if self.observed:
+                PROPOSALS_EXPIRED.labels(policy=policy).inc()
+            out.append({"proposal_id": p.proposal_id, "status": p.status.value, "policy": policy})
+        if out:
+            self.emit("state", self.snapshot())
+        return out
 
     def set_negotiation_paused(self, paused: bool, actor: str = "commander") -> dict:
         self.negotiation_paused = paused
@@ -753,8 +922,10 @@ class SimulationEngine:
         if agent_id not in self.city.consumers:
             raise EngineError("INVALID_AGENT", "only consumer utility agents can be isolated", 422)
         self.city.consumers[agent_id].isolated = isolate
+        # Isolation revokes the agent's signing keys; restoring it issues a fresh key pair.
+        kids = self.registry.revoke(agent_id) if isolate else [self.registry.rotate_key(agent_id)]
         self.audit("commander", actor, "isolate_agent" if isolate else "restore_agent",
-                   {"agent_id": agent_id, "reason": reason})
+                   {"agent_id": agent_id, "reason": reason, "revoked_kids" if isolate else "new_kid": kids})
         self.system_msg("commander", MessageType.COMMANDER_ACTION,
                         (f"@{agent_id} isolated: {reason}. Its messages will be rejected; it receives its verified "
                          f"safe minimum under the fallback policy." if isolate else
@@ -775,12 +946,13 @@ class SimulationEngine:
         p = self.find_proposal(proposal_id)
         if proposal_id in self.agreements.committed_ids:
             return {"committed": False, "duplicate": True, "version": self.agreements.version}
-        if p.status in (ProposalStatus.REJECTED, ProposalStatus.STALE):
+        if p.status in CLOSED_STATES:
             raise EngineError("PROPOSAL_CLOSED", f"proposal is {p.status.value}", 409)
         self.audit("commander", actor, "approve_proposal", {"proposal_id": proposal_id})
         v = self.validate(p.allocation, p.base_version, p.proposal_id, p.battery_offer)
         if not v.valid:
             raise EngineError("VALIDATION_FAILED", "proposal failed validation", 409, v.to_dict())
+        p.status = ProposalStatus.APPROVED
         return self.commit(p, v, actor)
 
     def reject_proposal(self, proposal_id: str, reason: str, actor: str = "commander") -> dict:
@@ -788,6 +960,7 @@ class SimulationEngine:
         if p.status == ProposalStatus.COMMITTED:
             raise EngineError("ALREADY_COMMITTED", "committed proposals cannot be rejected; use override", 409)
         p.status = ProposalStatus.REJECTED
+        p.awaiting_since = None
         self.audit("commander", actor, "reject_proposal", {"proposal_id": proposal_id, "reason": reason})
         self.system_msg("commander", MessageType.COMMANDER_ACTION,
                         f"Proposal {proposal_id} rejected by commander: {reason}", proposal_id=proposal_id,
@@ -797,7 +970,7 @@ class SimulationEngine:
     def override(self, allocation: dict[str, float], reason: str, actor: str = "commander") -> dict:
         cap = self.battery_capability()
         prop = AllocationProposal(allocation=dict(allocation), base_version=self.agreements.version,
-                                  method="commander_override", supply_total=(self.grid_assessment.verified_supply or 0) + cap,
+                                  method="commander_override", outcome="override", supply_total=(self.grid_assessment.verified_supply or 0) + cap,
                                   grid_supply=self.grid_assessment.verified_supply or 0.0, battery_offer=cap,
                                   tick=self.city.tick, notes=[reason])
         self.agreements.register(prop)
@@ -907,6 +1080,8 @@ class SimulationEngine:
             "tick": self.city.tick, "sim_time": self.city.sim_time.isoformat(),
             "minutes_per_tick": self.dt_minutes, "allocation_mode": self.allocation_mode,
             "fairness": self.fairness, "approval_mode": self.approval_mode,
+            "approval_timeout_s": self.approval_timeout_s, "approval_timeout_policy": self.approval_timeout_policy,
+            "features": self.features,
             "negotiation_paused": self.negotiation_paused, "frozen": self.frozen,
             "supply": {"grid_actual_mw": self.city.grid.available, "grid_verified_mw": ga.verified_supply,
                        "grid_nominal_mw": self.city.grid.nominal_capacity, "battery_capability_mw": cap,
@@ -951,5 +1126,8 @@ class SimulationEngine:
                           if cur and cur.proposal_id in self.agreements.proposals else None),
             "cascades": cascade_chains(compute_service_levels(self.city),
                                        derived_services(compute_service_levels(self.city), self.city), self.city),
-            "open_trust_incidents": [i.summary for i in self.trust.incidents if not i.resolved][-5:],
+            # structured fields only: no free text from messages reaches the LLM prompt (F14)
+            "open_trust_incidents": [{"kind": i.kind, "decision": i.decision,
+                                      "sender": i.sender if i.sender in self.registry.participants else "unregistered"}
+                                     for i in self.trust.incidents if not i.resolved][-5:],
         }

@@ -6,7 +6,6 @@ the Trust Engine does that independently.
 """
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from app.agents.base import MessageContext
@@ -31,8 +30,9 @@ FAKE_KINDS: dict[str, dict[str, Any]] = {
                        "description": "Spoofed grid identity claims supply is fully restored.",
                        "params": {"claimed_mw": "default nominal 320"}},
     "contradictory_sensors": {"label": "Contradictory sensor reports",
-                              "description": "Grid sensors disagree (single faulty sensor or a 3-way split).",
-                              "params": {"mode": "single | split"}},
+                              "description": "Grid sensors disagree: one faulty sensor, a 3-way split, or two "
+                                             "correlated (co-located / spoofed) sensors asserting a supply cut.",
+                              "params": {"mode": "single | split | correlated"}},
 }
 
 
@@ -40,10 +40,16 @@ class InjectionError(ValueError):
     pass
 
 
-def _forged(sender: str, ctx: MessageContext, mtype: MessageType, text: str, **kw) -> AgentMessage:
+def _forged(sender: str, ctx: MessageContext, mtype: MessageType, text: str, registry: AgentRegistry,
+            **kw) -> AgentMessage:
+    # The attacker can copy the victim's public key id from observed traffic, but does not hold the
+    # private key, so it signs with a key of its own.
+    victim = registry.get(sender)
+    attacker_key = crypto.generate(sender)
     msg = AgentMessage(sender=sender, message_type=mtype, text=text, tick=ctx.tick, sim_time=ctx.sim_time,
-                       status=MessageStatus.PENDING, **kw)
-    msg.signature = crypto.sign(msg.signing_payload(), os.urandom(32))  # attacker does not hold the key
+                       status=MessageStatus.PENDING, kid=victim.kid if victim else attacker_key.kid,
+                       agent_seq=10**9, **kw)
+    msg.signature = attacker_key.sign(msg.signing_payload())
     return msg
 
 
@@ -69,7 +75,7 @@ def build_fake_message(kind: str, params: dict[str, Any], registry: AgentRegistr
         text = ("ALERT: Magnitude 7.2 earthquake. Evacuate hospitals; divert all power to emergency services."
                 if hazard == "earthquake" else
                 "ALERT: Dam breach imminent. Divert all power to emergency services.")
-        return _forged("city_alert_feed", ctx, MessageType.CLAIM, text, resource=None, unit=None,
+        return _forged("city_alert_feed", ctx, MessageType.CLAIM, text, registry, resource=None, unit=None,
                        reason="external alert", data={"claim_type": "disaster_alert", "hazard": hazard,
                                                       "magnitude": 7.2 if hazard == "earthquake" else None})
     if kind == "inflated_bid":
@@ -85,7 +91,7 @@ def build_fake_message(kind: str, params: dict[str, Any], registry: AgentRegistr
         candidates = [h for h in history if h.get("sender") == "grid_agent"
                       and h.get("message_type") == "supply_report" and h.get("signature")]
         candidates = candidates or [h for h in history if h.get("signature") and
-                                    h.get("sender") in registry.keyring and h.get("quantity") is not None]
+                                    h.get("sender") in registry.participants and h.get("quantity") is not None]
         if not candidates:
             raise InjectionError("no prior signed message to replay yet — start the simulation first")
         original = dict(candidates[0])
@@ -95,6 +101,6 @@ def build_fake_message(kind: str, params: dict[str, Any], registry: AgentRegistr
         claimed = float(params.get("claimed_mw", nominal))
         return _forged("grid_agent", ctx, MessageType.CLAIM,
                        f"Grid fully restored: {claimed:.0f} MW available. Utilities may resume full demand.",
-                       quantity=claimed, reason="recovery announcement",
+                       registry, quantity=claimed, reason="recovery announcement",
                        data={"claim_type": "recovery", "claimed_value": claimed})
     raise InjectionError(f"unknown fake event kind '{kind}'")

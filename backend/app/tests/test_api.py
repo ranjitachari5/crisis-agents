@@ -3,8 +3,11 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 
 
+AUTH = {"Authorization": "Bearer test-token"}  # dev mode: the commander token also acts as admin
+
+
 def client(settings):
-    return TestClient(create_app(settings))
+    return TestClient(create_app(settings), headers=AUTH)
 
 
 def test_full_api_flow(settings):
@@ -32,8 +35,8 @@ def test_full_api_flow(settings):
         cur = c.get("/api/allocations/current").json()
         v = c.post("/api/allocations/validate", json={"allocation": cur["agreement"]["allocation"]}).json()
         assert v["valid"]
-        denied = c.post("/api/commander/override", json={"allocation": {"hospital_agent": 90},
-                                                         "reason": "testing", "authorization": "wrong"})
+        denied = c.post("/api/commander/override", json={"allocation": {"hospital_agent": 90}, "reason": "testing"},
+                        headers={"Authorization": "Bearer wrong"})
         assert denied.status_code == 403
         assert c.post("/api/commander/agents/telecom_agent/isolate", json={"reason": "test"}).json()["isolated"]
         e = c.post("/api/commander/explain", json={"question": "why?"}).json()
