@@ -221,4 +221,43 @@ export const api = {
   twin: {
     graph: () => request<TwinGraph>("/api/twin/graph"),
   },
+
+  auth: {
+    verify: async (token: string): Promise<{ valid: boolean; error?: string }> => {
+      try {
+        const res = await fetch("/api/simulation/settings", {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token.trim()}`,
+          },
+          body: JSON.stringify({}),
+        });
+        if (res.ok) {
+          return { valid: true };
+        }
+        if (res.status === 403) {
+          return {
+            valid: false,
+            error: "Access Denied: Token does not have Commander or Admin authorization.",
+          };
+        }
+        if (res.status === 429) {
+          return {
+            valid: false,
+            error: "Rate Limited: Too many failed authentication attempts. Please wait 60 seconds.",
+          };
+        }
+        return {
+          valid: false,
+          error: `Authentication failed (HTTP ${res.status}).`,
+        };
+      } catch {
+        return {
+          valid: false,
+          error: "Connection Error: Unable to communicate with the backend server at 127.0.0.1:8000.",
+        };
+      }
+    },
+  },
 };

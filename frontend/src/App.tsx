@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { TopBar } from "@/components/TopBar";
 import { Sidebar } from "@/components/Sidebar";
+import { CommanderLoginPage } from "@/components/CommanderLoginPage";
 import { useScrollSpy } from "@/hooks/useScrollSpy";
 import { useSimulationSocket } from "@/hooks/useSimulationSocket";
 import { OverviewSection } from "@/sections/OverviewSection";
@@ -12,12 +13,13 @@ import { AllocationSection } from "@/sections/AllocationSection";
 import { LabSection } from "@/sections/LabSection";
 import { AuditSection } from "@/sections/AuditSection";
 import { useSimStore } from "@/store/useSimStore";
+import { useAuthStore } from "@/store/useAuthStore";
 
-export function App() {
+function CommanderDashboard() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const { activeId, scrollTo } = useScrollSpy(90);
 
-  // Initialize live simulation WebSocket feed
+  // Initialize live simulation WebSocket feed with authorized token
   useSimulationSocket();
 
   // Read live state from Zustand store
@@ -58,6 +60,18 @@ export function App() {
       </main>
     </div>
   );
+}
+
+export function App() {
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+
+  // When not authenticated, show only the Commander Login Page
+  if (!isAuthenticated) {
+    return <CommanderLoginPage />;
+  }
+
+  // Once authenticated as Commander, enter the Command Center
+  return <CommanderDashboard />;
 }
 
 export default App;
