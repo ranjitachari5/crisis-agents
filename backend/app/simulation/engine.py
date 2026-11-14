@@ -13,7 +13,8 @@ from app.agents.base import AGENT_META, MessageContext
 from app.agents.registry import AgentRegistry
 from app.config import Settings
 from app.evaluation.metrics import MetricsTracker
-from app.models.state import CONSUMER_IDS, CONSUMER_PROFILES, CityState, feeders, initial_city
+from app.models.state import CONSUMER_IDS, CONSUMER_PROFILES, CityState, ConsumerProfile, ConsumerState, feeders, initial_city
+from app.schemas import api as S
 from app.negotiation.agreements import (CLOSED_STATES, Agreement, AgreementStore, AllocationProposal, CommitError,
                                         ProposalStatus)
 from app.observability import (COMMITS, NEG_MESSAGES, NEG_ROUNDS, NEG_SECONDS, NEG_TOTAL, PROPOSALS_EXPIRED,
@@ -1025,7 +1026,7 @@ class SimulationEngine:
 
     # -------------------------------------------------------------- views
     def agent_summary(self, aid: str) -> dict:
-        meta = AGENT_META[aid]
+        meta = AGENT_META.get(aid, {"display_name": aid, "role": "Utility Agent", "icon": "Cpu", "color": "#38bdf8"})
         rep = self.trust.reputation.get(aid)
         if aid in self.city.consumers:
             c = self.city.consumers[aid]
@@ -1054,8 +1055,82 @@ class SimulationEngine:
                 "sensors": dict(zip(GRID_SENSOR_IDS, self.telemetry.grid_sensors)),
                 "reserve_margin_mw": ga.margin, "override_mw": self.city.grid.supply_override, "reputation": rep}
 
+    def add_custom_consumer(self, req: S.CreateAgentRequest) -> dict:
+        aid = req.agent_id
+        if aid in self.city.consumers or aid in ("grid_agent", "battery_agent"):
+            raise EngineError("AGENT_EXISTS", f"Agent '{aid}' already exists", 409)
+
+        profile = ConsumerProfile(
+            agent_id=aid,
+            name=req.name,
+            base_demand=req.base_demand,
+            min_safe=req.min_safe,
+            max_allowed=req.max_allowed,
+            damage_weight=req.damage_weight,
+            critical_weight=req.critical_weight,
+            concession_rate=req.concession_rate,
+            peer_grant_fraction=req.peer_grant_fraction,
+            dependencies=dict(req.dependencies),
+            ramp_up_mw_per_min=2.0,
+            feeder=req.feeder,
+        )
+        CONSUMER_PROFILES[aid] = profile
+
+        # Register in agent registry (generates Ed25519 key, registers in public_keys)
+        agent = self.registry.add_consumer(profile)
+
+        # Create consumer state in city
+        c_state = ConsumerState(
+            agent_id=aid,
+            base_demand=req.base_demand,
+            demand=req.base_demand,
+            min_safe=req.min_safe,
+            max_allowed=req.max_allowed,
+            health=1.0,
+            operational_capacity=1.0,
+            connected=True,
+            isolated=False,
+            allocation=0.0,
+        )
+        self.city.consumers[aid] = c_state
+
+        # Register metadata for UI
+        AGENT_META[aid] = {
+            "display_name": req.name,
+            "role": req.role,
+            "icon": req.icon,
+            "color": req.color,
+        }
+
+        # Refresh telemetry and feed to agent
+        self.refresh_telemetry()
+        agent.observe(self.telemetry)
+        agent.observe_local(c_state)
+
+        # Audit log entry
+        self.audit("commander", "commander", "create_custom_agent", {
+            "agent_id": aid,
+            "name": req.name,
+            "feeder": req.feeder,
+            "base_demand": req.base_demand,
+            "min_safe": req.min_safe,
+        })
+
+        # Run negotiation immediately if requested so the agent begins participating
+        if req.start_negotiation:
+            self.run_negotiation(f"New utility '{req.name}' joined the municipal grid")
+
+        snap = self.snapshot()
+        self.emit("state", snap)
+
+        return {
+            "agent": self.agent_summary(aid),
+            "negotiation_started": req.start_negotiation,
+            "state": snap,
+        }
+
     def agents(self) -> list[dict]:
-        return [self.agent_summary(a) for a in list(CONSUMER_IDS) + ["battery_agent", "grid_agent"]]
+        return [self.agent_summary(a) for a in list(self.city.consumers) + ["battery_agent", "grid_agent"]]
 
     def graph(self) -> dict:
         b = self.city.battery

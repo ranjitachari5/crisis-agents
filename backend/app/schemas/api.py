@@ -9,8 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.simulation.events import EventType
 
 ScenarioName = Literal["grid_shortage", "flood_cascade", "normal"]
-ConsumerId = Literal["hospital_agent", "water_agent", "telecom_agent", "emergency_agent"]
-AgentId = Literal["hospital_agent", "water_agent", "telecom_agent", "emergency_agent", "battery_agent", "grid_agent"]
+ConsumerId = str
+AgentId = str
 FakeKind = Literal["false_capacity_drop", "fake_disaster_alert", "inflated_bid", "replay_message",
                    "false_recovery", "contradictory_sensors"]
 Mode = Literal["negotiation", "centralized", "fixed_priority", "fcfs", "rolling_horizon", "hidden_information",
@@ -147,6 +147,50 @@ class OverrideRequest(Strict):
 
 class IsolateRequest(Strict):
     reason: str = Field(default="suspicious behaviour reported by trust engine", max_length=300)
+
+
+class CreateAgentRequest(Strict):
+    model_config = example({
+        "agent_id": "datacenter_agent",
+        "name": "Data Center Agent",
+        "role": "Cloud infrastructure & compute",
+        "icon": "Cpu",
+        "color": "#38bdf8",
+        "base_demand": 45.0,
+        "min_safe": 25.0,
+        "max_allowed": 70.0,
+        "damage_weight": 8.0,
+        "critical_weight": 75.0,
+        "concession_rate": 0.35,
+        "peer_grant_fraction": 0.5,
+        "feeder": "feeder_south",
+        "dependencies": {},
+        "start_negotiation": True,
+    })
+
+    agent_id: str = Field(min_length=3, max_length=32, pattern=r"^[a-z0-9_]+$")
+    name: str = Field(min_length=2, max_length=64)
+    role: str = Field(default="Custom Critical Utility", max_length=64)
+    icon: str = Field(default="Cpu", max_length=32)
+    color: str = Field(default="#38bdf8", max_length=16)
+    base_demand: float = Field(gt=0, le=1000, description="Base power demand in MW")
+    min_safe: float = Field(gt=0, le=1000, description="Hard safe minimum MW")
+    max_allowed: float = Field(gt=0, le=2000, description="Physical connection ceiling MW")
+    damage_weight: float = Field(default=8.0, ge=1.0, le=100.0)
+    critical_weight: float = Field(default=80.0, ge=10.0, le=500.0)
+    concession_rate: float = Field(default=0.3, ge=0.05, le=0.95)
+    peer_grant_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
+    feeder: Literal["feeder_north", "feeder_south"] = "feeder_south"
+    dependencies: dict[str, float] = Field(default_factory=dict)
+    start_negotiation: bool = Field(default=True)
+
+    @model_validator(mode="after")
+    def _validate_bounds(self):
+        if self.min_safe > self.base_demand:
+            raise ValueError("min_safe cannot exceed base_demand")
+        if self.base_demand > self.max_allowed:
+            raise ValueError("base_demand cannot exceed max_allowed")
+        return self
 
 
 class ExplainRequest(Strict):

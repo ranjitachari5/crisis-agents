@@ -9,8 +9,9 @@ import {
   Scale,
   Layers,
   ArrowRightLeft,
+  Cpu,
 } from "lucide-react";
-import { AGENTS, edgeId } from "@/lib/agents";
+import { AGENTS, getAgentDef, edgeId } from "@/lib/agents";
 import { HUB_NODE_ID } from "@/lib/constants";
 import { useAgentActivity } from "@/hooks/useAgentActivity";
 import { useSimStore } from "@/store/useSimStore";
@@ -25,7 +26,11 @@ interface AgentCoord {
   pctY: number; // CSS % top
 }
 
-export function AgentNetwork() {
+interface Props {
+  onDeployAgent?: () => void;
+}
+
+export function AgentNetwork({ onDeployAgent }: Props = {}) {
   const snapshot = useSimStore((s) => s.snapshot);
   const setSelectedAgent = useSimStore((s) => s.setSelectedAgent);
   const { getAgentHighlight, getEdgeHighlight } = useAgentActivity();
@@ -35,21 +40,49 @@ export function AgentNetwork() {
   const cx = 500;
   const cy = 300;
 
-  // 6 Radial Agent Positions: generous margins so all text sits cleanly with zero overlap
-  const agentCoords: AgentCoord[] = useMemo(() => [
-    // Top: Grid Supply
-    { id: "grid_agent", x: 500, y: 85, pctX: 50, pctY: 14 },
-    // Top-Right: Battery Storage
-    { id: "battery_agent", x: 800, y: 175, pctX: 80, pctY: 29 },
-    // Bottom-Right: Hospital Agent (Critical Consumer)
-    { id: "hospital_agent", x: 800, y: 425, pctX: 80, pctY: 71 },
-    // Bottom: Water Utility
-    { id: "water_agent", x: 500, y: 515, pctX: 50, pctY: 86 },
-    // Bottom-Left: Telecom Utility
-    { id: "telecom_agent", x: 200, y: 425, pctX: 20, pctY: 71 },
-    // Top-Left: Emergency Services
-    { id: "emergency_agent", x: 200, y: 175, pctX: 20, pctY: 29 },
-  ], []);
+  // Radial Agent Positions: generous margins so all text sits cleanly with zero overlap
+  const agentCoords: AgentCoord[] = useMemo(() => {
+    const base: AgentCoord[] = [
+      // Top: Grid Supply
+      { id: "grid_agent", x: 500, y: 85, pctX: 50, pctY: 14 },
+      // Top-Right: Battery Storage
+      { id: "battery_agent", x: 800, y: 175, pctX: 80, pctY: 29 },
+      // Bottom-Right: Hospital Agent (Critical Consumer)
+      { id: "hospital_agent", x: 800, y: 425, pctX: 80, pctY: 71 },
+      // Bottom: Water Utility
+      { id: "water_agent", x: 500, y: 515, pctX: 50, pctY: 86 },
+      // Bottom-Left: Telecom Utility
+      { id: "telecom_agent", x: 200, y: 425, pctX: 20, pctY: 71 },
+      // Top-Left: Emergency Services
+      { id: "emergency_agent", x: 200, y: 175, pctX: 20, pctY: 29 },
+    ];
+
+    const knownIds = new Set(base.map((b) => b.id as string));
+    const customSlots = [
+      { x: 920, y: 300, pctX: 92, pctY: 50 },
+      { x: 80, y: 300, pctX: 8, pctY: 50 },
+      { x: 670, y: 520, pctX: 67, pctY: 87 },
+      { x: 330, y: 520, pctX: 33, pctY: 87 },
+      { x: 670, y: 80, pctX: 67, pctY: 13 },
+      { x: 330, y: 80, pctX: 33, pctY: 13 },
+    ];
+
+    const extraAgents = (snapshot?.agents ?? []).filter(
+      (a: AgentView) => !knownIds.has(a.agent_id)
+    );
+    extraAgents.forEach((a: AgentView, idx: number) => {
+      const slot = customSlots[idx % customSlots.length];
+      base.push({
+        id: a.agent_id,
+        x: slot.x,
+        y: slot.y,
+        pctX: slot.pctX,
+        pctY: slot.pctY,
+      });
+    });
+
+    return base;
+  }, [snapshot?.agents]);
 
   // Hub Spoke Edges (Agent <-> Hub)
   const hubEdges = useMemo(() => {
@@ -112,7 +145,7 @@ export function AgentNetwork() {
       case "grid_agent":
         return <Zap {...props} className="text-[#FBBF24]" />;
       default:
-        return <Zap {...props} />;
+        return <Cpu {...props} className="text-[#38BDF8]" />;
     }
   };
 
@@ -307,10 +340,10 @@ export function AgentNetwork() {
           </div>
         </div>
 
-        {/* 6 Radial Agent Cards (HTML Overlay with clean typography) */}
+        {/* Radial Agent Cards (HTML Overlay with clean typography) */}
         {agentCoords.map((coord) => {
-          const meta = AGENTS[coord.id];
           const aView = snapshot?.agents?.find((a: AgentView) => a.agent_id === coord.id);
+          const meta = getAgentDef(coord.id, aView?.display_name || aView?.name);
           const status = aView?.status ?? "online";
           const isIsolated = status === "isolated";
           const isDisconnected = status === "disconnected";

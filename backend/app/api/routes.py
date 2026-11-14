@@ -96,6 +96,8 @@ async def list_agents(r: SimulationRuntime = R):
 @read.get("/agents/{agent_id}", tags=["agents"])
 async def get_agent(agent_id: S.AgentId, r: SimulationRuntime = R):
     def run():
+        if agent_id not in r.engine.city.consumers and agent_id not in ("battery_agent", "grid_agent"):
+            raise EngineError("INVALID_AGENT", f"unknown agent {agent_id}", 422)
         info = r.engine.agent_summary(agent_id)
         info["recent_messages"] = [m for m in r.engine.messages if m["sender"] == agent_id][-25:]
         info["active_kids"] = r.engine.registry.public_keys.active_kids(agent_id)
@@ -292,6 +294,13 @@ async def resolve(body: S.ResolveIncidentRequest, incident_id: str = Path(..., m
 async def explain(body: S.ExplainRequest | None = None, r: SimulationRuntime = R):
     body = body or S.ExplainRequest()
     return await r.explain(body.question)
+
+
+@control.post("/commander/agents", tags=["commander"])
+async def create_custom_agent(body: S.CreateAgentRequest, r: SimulationRuntime = R):
+    def run():
+        return r.engine.add_custom_consumer(body)
+    return await r.call(run)
 
 
 @control.post("/commander/agents/{agent_id}/isolate", tags=["commander"])

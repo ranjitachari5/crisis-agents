@@ -1,6 +1,6 @@
-import { useState, useId } from "react";
+import { useState, useId, useMemo } from "react";
 import { X, ShieldAlert, CheckCircle2, AlertTriangle, AlertOctagon, KeyRound } from "lucide-react";
-import { AGENTS, CONSUMER_IDS } from "@/lib/agents";
+import { AGENTS, CONSUMER_IDS, getAgentDef } from "@/lib/agents";
 import { formatMw } from "@/lib/format";
 import { api } from "@/services/api";
 import { errorMessage } from "@/lib/errors";
@@ -20,10 +20,24 @@ export function OverrideDialog({ isOpen, onClose, onSuccess }: Props) {
   const verifiedSupply =
     snapshot?.supply?.grid_verified_mw ?? snapshot?.supply?.total_available_mw ?? 200;
 
+  const consumerIds = useMemo(() => {
+    const list: ConsumerId[] = [...CONSUMER_IDS];
+    const set = new Set(list as string[]);
+    if (snapshot?.agents) {
+      for (const a of snapshot.agents) {
+        if (a.kind === "consumer" && !set.has(a.agent_id)) {
+          list.push(a.agent_id as ConsumerId);
+          set.add(a.agent_id);
+        }
+      }
+    }
+    return list;
+  }, [snapshot?.agents]);
+
   // Initialize allocation values from current allocation or min safe
   const getInitialAllocations = (): Record<ConsumerId, number> => {
     const initial: Partial<Record<ConsumerId, number>> = {};
-    for (const id of CONSUMER_IDS) {
+    for (const id of consumerIds) {
       if (activeAgreement?.allocation?.[id] != null) {
         initial[id] = activeAgreement.allocation[id];
       } else {
@@ -140,9 +154,9 @@ export function OverrideDialog({ isOpen, onClose, onSuccess }: Props) {
               <span>Allocated (MW)</span>
             </div>
 
-            {CONSUMER_IDS.map((agentId) => {
-              const def = AGENTS[agentId];
+            {consumerIds.map((agentId) => {
               const agentView = snapshot?.agents?.find((a) => a.agent_id === agentId);
+              const def = getAgentDef(agentId, agentView?.display_name);
               const demand = agentView && "demand_mw" in agentView ? agentView.demand_mw : 0;
               const minSafe = agentView && "min_safe_mw" in agentView ? agentView.min_safe_mw : 0;
               const value = allocations[agentId] ?? 0;

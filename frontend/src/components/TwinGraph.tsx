@@ -121,8 +121,12 @@ export function TwinGraph({ graph, activeCascade, onClearCascadeTrace }: Props) 
   const nodes: Node<TwinNodeData>[] = useMemo(() => {
     if (!graph || !graph.nodes) return [];
 
-    return graph.nodes.map((n) => {
-      const pos = NODE_COORDINATES[n.id] ?? { x: 100, y: 100 };
+    return graph.nodes.map((n, idx) => {
+      const pos =
+        NODE_COORDINATES[n.id] ?? {
+          x: 540,
+          y: 90 + ((idx * 85) % 340),
+        };
       const isHighlighted = highlightedNodeIds.has(n.id);
       const isCascadeRoot = activeCascade?.root === n.id;
 

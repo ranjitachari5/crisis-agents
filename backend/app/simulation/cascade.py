@@ -14,6 +14,12 @@ from app.models.state import CONSUMER_PROFILES, CityState
 
 ORDER = ("water_agent", "telecom_agent", "hospital_agent", "emergency_agent")  # topological
 
+
+def consumer_order(city: CityState) -> list[str]:
+    base = [aid for aid in ORDER if aid in city.consumers]
+    extra = [aid for aid in city.consumers if aid not in base]
+    return base + extra
+
 DERIVED_SERVICES: dict[str, dict[str, Any]] = {
     "svc_icu": {"label": "ICU life support", "inputs": {"hospital_agent": 1.0}},
     "svc_hospital_water": {"label": "Hospital water availability", "inputs": {"water_agent": 1.0}},
@@ -33,7 +39,7 @@ def power_service(alloc: float, demand: float, min_safe: float) -> float:
 
 def compute_service_levels(city: CityState) -> dict[str, dict]:
     levels: dict[str, dict] = {}
-    for aid in ORDER:
+    for aid in consumer_order(city):
         c = city.consumers[aid]
         ps = power_service(c.allocation, c.effective_demand, c.effective_min)
         if not c.connected:
@@ -75,17 +81,21 @@ def cascade_chains(levels: dict[str, dict], derived: dict[str, dict], city: City
     chains = []
     names = {"water_agent": "Water pumping", "telecom_agent": "Telecom network",
              "hospital_agent": "Hospital", "emergency_agent": "Emergency services"}
-    for root in ORDER:
-        if levels[root]["effective"] >= 0.95:
+    for root in consumer_order(city):
+        if root not in levels or levels[root]["effective"] >= 0.95:
             continue
         c = city.consumers[root]
+        root_name = names.get(root, CONSUMER_PROFILES[root].name if root in CONSUMER_PROFILES else root)
         cause = ("asset failure" if c.operational_capacity < 1 or c.health < 0.9
                  else "power shortfall" if c.allocation < c.effective_demand - 0.5 else "dependency loss")
-        path = [f"{names[root]} degraded to {levels[root]['effective']*100:.0f}% ({cause})"]
-        for down in ORDER:
+        path = [f"{root_name} degraded to {levels[root]['effective']*100:.0f}% ({cause})"]
+        for down in consumer_order(city):
+            if down not in levels:
+                continue
+            down_name = names.get(down, CONSUMER_PROFILES[down].name if down in CONSUMER_PROFILES else down)
             for edge in levels[down]["cascade_from"]:
                 if edge["from"] == root and edge["loss"] > 0.01:
-                    path.append(f"{names[down]} service −{edge['loss']*100:.0f}%")
+                    path.append(f"{down_name} service −{edge['loss']*100:.0f}%")
         for sid, d in derived.items():
             if root in d["inputs"] and d["level"] < 0.95:
                 path.append(f"{d['label']} at {d['level']*100:.0f}%")
@@ -118,10 +128,11 @@ def build_graph(city: CityState, battery_flow: float, grid_flow: float) -> dict:
         {"id": "e-bat-bus", "source": "battery_agent", "target": "power_bus", "kind": "power",
          "data": {"mw": round(max(0.0, battery_flow), 3)}},
     ]
-    for aid in ORDER:
+    for aid in consumer_order(city):
         c = city.consumers[aid]
-        lv = levels[aid]
-        nodes.append({"id": aid, "type": "utility", "label": CONSUMER_PROFILES[aid].name,
+        lv = levels.get(aid, {"power_service": 1.0, "asset_service": 1.0, "effective": 1.0, "cascade_from": []})
+        label = CONSUMER_PROFILES[aid].name if aid in CONSUMER_PROFILES else aid
+        nodes.append({"id": aid, "type": "utility", "label": label,
                       "data": {"allocation_mw": c.allocation, "demand_mw": c.effective_demand,
                                "min_safe_mw": c.effective_min, "health": round(c.health, 4),
                                "operational_capacity": c.operational_capacity,

@@ -9,6 +9,7 @@ import type {
   AllocationProposal,
   AuditLog,
   ConsumerId,
+  CreateAgentRequest,
   CurrentAllocations,
   EvaluationPlan,
   EvaluationRun,
@@ -163,7 +164,10 @@ export const api = {
           ...(confirmed_supply_mw !== undefined ? { confirmed_supply_mw } : {}),
         }),
       }),
-    reputation: () => request<Record<string, number>>("/api/trust/reputation"),
+    reputation: () =>
+      request<{ agents: Record<string, number>; sensors: Record<string, number> } | Record<string, number>>(
+        "/api/trust/reputation"
+      ),
     quarantine: () => request<QuarantineEntry[]>("/api/trust/quarantine"),
   },
 
@@ -189,6 +193,14 @@ export const api = {
         method: "POST",
         ...jsonBody({ reason: reason ?? "suspicious behaviour reported by trust engine" }),
       }),
+    createAgent: (data: CreateAgentRequest) =>
+      request<{ agent: AgentDetail; negotiation_started: boolean; state: SimulationSnapshot }>(
+        "/api/commander/agents",
+        {
+          method: "POST",
+          ...jsonBody(data),
+        }
+      ),
     restore: (agentId: ConsumerId) =>
       request<Record<string, unknown>>(`/api/commander/agents/${agentId}/restore`, {
         method: "POST",

@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import {
   ResponsiveContainer,
   BarChart,
@@ -10,7 +11,7 @@ import {
   Legend,
 } from "recharts";
 import { ShieldAlert, AlertTriangle } from "lucide-react";
-import { AGENTS, CONSUMER_IDS } from "@/lib/agents";
+import { AGENTS, CONSUMER_IDS, getAgentDef } from "@/lib/agents";
 import { formatMw } from "@/lib/format";
 import { useSimStore } from "@/store/useSimStore";
 import type { ConsumerId } from "@/types/api";
@@ -27,10 +28,24 @@ export function AllocationChart({ onOpenOverride }: Props) {
   const isDegradation = activeAgreement?.degradation_mode ?? false;
   const version = activeAgreement?.version ?? null;
 
+  const consumerIds = useMemo(() => {
+    const list: string[] = [...CONSUMER_IDS];
+    const set = new Set(list);
+    if (snapshot?.agents) {
+      for (const a of snapshot.agents) {
+        if (a.kind === "consumer" && !set.has(a.agent_id)) {
+          list.push(a.agent_id);
+          set.add(a.agent_id);
+        }
+      }
+    }
+    return list;
+  }, [snapshot?.agents]);
+
   // Prepare data for per-agent bar chart
-  const barData = CONSUMER_IDS.map((agentId) => {
-    const agentDef = AGENTS[agentId];
+  const barData = consumerIds.map((agentId) => {
     const agentView = snapshot?.agents?.find((a) => a.agent_id === agentId);
+    const agentDef = getAgentDef(agentId, agentView?.display_name);
     const demand = agentView && "demand_mw" in agentView ? (agentView.demand_mw ?? 0) : 0;
     const minSafe = agentView && "min_safe_mw" in agentView ? (agentView.min_safe_mw ?? 0) : 0;
     const allocated = activeAgreement?.allocation?.[agentId] ?? 0;

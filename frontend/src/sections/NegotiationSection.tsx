@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { Play, Pause, ArrowDown } from "lucide-react";
 import { AgentCard } from "@/components/AgentCard";
 import { AgentDrawer } from "@/components/AgentDrawer";
@@ -78,73 +78,93 @@ export function NegotiationSection() {
     }
   }
 
-  // Ensure all 6 agents exist in order
-  const orderedAgents: AgentView[] = AGENT_IDS.map((id) => {
-    const found = agentsMap.get(id);
-    if (found) return found;
+  // Ensure all base agents exist in order, then append any custom registered agents
+  const orderedAgents: AgentView[] = useMemo(() => {
+    const list: AgentView[] = [];
+    const addedIds = new Set<string>();
 
-    if (id === "battery_agent") {
-      return {
-        agent_id: "battery_agent",
-        display_name: "Battery Agent",
-        role: "Grid-scale storage",
-        icon: "BatteryCharging",
-        kind: "storage",
-        status: "online",
-        soc: 0.8,
-        reserve_fraction: 0.2,
-        capacity_mwh: 120,
-        usable_energy_mwh: 72,
-        capability_mw: 30,
-        discharge_mw: 0,
-        max_discharge_mw: 30,
-        reputation: 1.0,
-      };
+    for (const id of AGENT_IDS) {
+      const found = agentsMap.get(id);
+      if (found) {
+        list.push(found);
+      } else {
+        if (id === "battery_agent") {
+          list.push({
+            agent_id: "battery_agent",
+            display_name: "Battery Agent",
+            role: "Grid-scale storage",
+            icon: "BatteryCharging",
+            kind: "storage",
+            status: "online",
+            soc: 0.8,
+            reserve_fraction: 0.2,
+            capacity_mwh: 120,
+            usable_energy_mwh: 72,
+            capability_mw: 30,
+            discharge_mw: 0,
+            max_discharge_mw: 30,
+            reputation: 1.0,
+          });
+        } else if (id === "grid_agent") {
+          list.push({
+            agent_id: "grid_agent",
+            display_name: "Grid Agent",
+            role: "Supply & grid telemetry",
+            icon: "Zap",
+            kind: "supply",
+            status: "online",
+            nominal_mw: 200,
+            verified_supply_mw: 200,
+            sensor_status: "consensus",
+            sensors: {},
+            reserve_margin_mw: 0,
+            override_mw: null,
+            reputation: 1.0,
+          });
+        } else {
+          list.push({
+            agent_id: id,
+            display_name: id.replace(/_/g, " "),
+            role: "Utility service",
+            icon: "Activity",
+            kind: "consumer",
+            status: "online",
+            demand_mw: 80,
+            min_safe_mw: 50,
+            max_allowed_mw: 100,
+            allocation_mw: 50,
+            service_level: 1.0,
+            health: 1.0,
+            operational_capacity: 1.0,
+            active_operations: false,
+            ticks_below_min: 0,
+            ticks_conceding: 0,
+            urgency: 0.5,
+            reputation: 1.0,
+            policy: {
+              concession_rate: 0.3,
+              peer_grant_fraction: 0.5,
+              critical_weight: 50,
+              dependencies: {},
+            },
+          });
+        }
+      }
+      addedIds.add(id);
     }
-    if (id === "grid_agent") {
-      return {
-        agent_id: "grid_agent",
-        display_name: "Grid Agent",
-        role: "Supply & grid telemetry",
-        icon: "Zap",
-        kind: "supply",
-        status: "online",
-        nominal_mw: 200,
-        verified_supply_mw: 200,
-        sensor_status: "consensus",
-        sensors: {},
-        reserve_margin_mw: 0,
-        override_mw: null,
-        reputation: 1.0,
-      };
+
+    // Append any custom utilities present in the simulation snapshot
+    if (snapshot?.agents) {
+      for (const a of snapshot.agents) {
+        if (!addedIds.has(a.agent_id)) {
+          list.push(a);
+          addedIds.add(a.agent_id);
+        }
+      }
     }
-    return {
-      agent_id: id,
-      display_name: id.replace(/_/g, " "),
-      role: "Utility service",
-      icon: "Activity",
-      kind: "consumer",
-      status: "online",
-      demand_mw: 80,
-      min_safe_mw: 50,
-      max_allowed_mw: 100,
-      allocation_mw: 50,
-      service_level: 1.0,
-      health: 1.0,
-      operational_capacity: 1.0,
-      active_operations: false,
-      ticks_below_min: 0,
-      ticks_conceding: 0,
-      urgency: 0.5,
-      reputation: 1.0,
-      policy: {
-        concession_rate: 0.3,
-        peer_grant_fraction: 0.5,
-        critical_weight: 50,
-        dependencies: {},
-      },
-    };
-  });
+
+    return list;
+  }, [snapshot?.agents, agentsMap]);
 
   // Filter messages
   const filteredMessages = messages.filter((m) =>
@@ -242,7 +262,7 @@ export function NegotiationSection() {
         <div className="lg:col-span-5 space-y-3">
           <div className="flex items-center justify-between">
             <span className="text-11 uppercase font-semibold text-muted tracking-wider">
-              Utility Agents (6)
+              Utility Agents ({orderedAgents.length})
             </span>
             <span className="text-11 text-muted">Click card for detail</span>
           </div>

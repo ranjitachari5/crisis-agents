@@ -1,14 +1,36 @@
+import { useMemo } from "react";
 import { Shield } from "lucide-react";
-import { AGENTS, AGENT_IDS } from "@/lib/agents";
+import { AGENT_IDS, getAgentDef } from "@/lib/agents";
 
 interface Props {
-  reputation: Record<string, number>;
+  reputation?: Record<string, number> | { agents?: Record<string, number> };
 }
 
 export function ReputationList({ reputation }: Props) {
-  const entries = AGENT_IDS.map((agentId) => {
-    const def = AGENTS[agentId];
-    const score = reputation[agentId] ?? 1.0;
+  const normRep: Record<string, number> = useMemo(() => {
+    if (!reputation || typeof reputation !== "object") return {};
+    if ("agents" in reputation && reputation.agents && typeof reputation.agents === "object") {
+      return reputation.agents as Record<string, number>;
+    }
+    return reputation as Record<string, number>;
+  }, [reputation]);
+
+  const allIds = useMemo(() => {
+    const list = [...AGENT_IDS];
+    const set = new Set(list as string[]);
+    for (const id of Object.keys(normRep)) {
+      if (id !== "agents" && id !== "sensors" && typeof normRep[id] === "number" && !set.has(id)) {
+        list.push(id as any);
+        set.add(id);
+      }
+    }
+    return list;
+  }, [normRep]);
+
+  const entries = allIds.map((agentId) => {
+    const def = getAgentDef(agentId);
+    const rawScore = normRep[agentId];
+    const score = typeof rawScore === "number" && !isNaN(rawScore) ? rawScore : 1.0;
     return {
       agentId,
       name: def?.name ?? agentId,

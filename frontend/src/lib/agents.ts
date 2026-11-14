@@ -93,7 +93,18 @@ export function isConsumerId(id: string): id is ConsumerId {
 }
 
 export function agentName(id: string): string {
-  return isAgentId(id) ? AGENTS[id].name : id;
+  return isAgentId(id) ? AGENTS[id].name : id.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+export function getAgentDef(id: string, name?: string): AgentDef {
+  if (id in AGENTS) return AGENTS[id as AgentId];
+  return {
+    id: id as AgentId,
+    name: name || id.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
+    icon: "Cpu",
+    role: "Autonomous Utility",
+    canIsolate: true,
+  };
 }
 
 export function edgeId(a: string, b: string): string {

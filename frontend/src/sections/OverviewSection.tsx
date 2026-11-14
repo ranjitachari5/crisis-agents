@@ -41,9 +41,12 @@ export function OverviewSection() {
   const supplyMw = snapshot?.supply?.total_available_mw ?? 0;
   const demandMw = snapshot?.demand_total_mw ?? 0;
   const deficitMw = snapshot?.deficit_mw ?? 0;
+  const totalAgents = snapshot?.agents?.length ?? 6;
   const onlineAgents =
     snapshot?.agents?.filter((a) => a.status === "online").length ??
-    (snapshot ? 6 : 0);
+    totalAgents;
+  const consumerCount =
+    snapshot?.agents?.filter((a) => a.kind === "consumer").length ?? 4;
   const activeAlertsList = alerts.filter((a) => a.active);
   const round =
     snapshot?.last_negotiation?.rounds ??
@@ -232,7 +235,7 @@ export function OverviewSection() {
         <MetricTile
           label="Total Demand"
           value={formatMw(demandMw)}
-          subtext="4 consumer utilities"
+          subtext={`${consumerCount} consumer utilities`}
         />
         <MetricTile
           label="Deficit"
@@ -242,7 +245,7 @@ export function OverviewSection() {
         />
         <MetricTile
           label="Active Agents"
-          value={`${onlineAgents} / 6`}
+          value={`${onlineAgents} / ${totalAgents}`}
           subtext="Online agents"
         />
         <MetricTile

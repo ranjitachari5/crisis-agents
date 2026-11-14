@@ -3,9 +3,10 @@ export type ConsumerId =
   | "hospital_agent"
   | "water_agent"
   | "telecom_agent"
-  | "emergency_agent";
+  | "emergency_agent"
+  | (string & {});
 export type SupplierId = "battery_agent" | "grid_agent";
-export type AgentId = ConsumerId | SupplierId;
+export type AgentId = ConsumerId | SupplierId | (string & {});
 export type SimulationStatus = "idle" | "running" | "paused";
 export type AgentStatus = "online" | "isolated" | "disconnected";
 export type AgentKind = "consumer" | "storage" | "supply";
@@ -511,4 +512,22 @@ export interface NegotiationHistory {
   messages: AgentMessage[];
   negotiations: NegotiationSummary[];
   last_seq: number;
+}
+
+export interface CreateAgentRequest {
+  agent_id: string;
+  name: string;
+  role?: string;
+  icon?: string;
+  color?: string;
+  base_demand: number;
+  min_safe: number;
+  max_allowed: number;
+  damage_weight?: number;
+  critical_weight?: number;
+  concession_rate?: number;
+  peer_grant_fraction?: number;
+  feeder?: "feeder_north" | "feeder_south";
+  dependencies?: Record<string, number>;
+  start_negotiation?: boolean;
 }

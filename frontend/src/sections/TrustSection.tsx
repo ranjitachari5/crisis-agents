@@ -64,7 +64,13 @@ export function TrustSection() {
       ]);
       setIncidents(incRes);
       setQuarantine(quatRes);
-      setReputation(repRes);
+      const agentReps =
+        repRes && typeof repRes === "object" && "agents" in repRes
+          ? (repRes as { agents: Record<string, number> }).agents
+          : (repRes as Record<string, number>);
+      if (agentReps) {
+        setReputation(agentReps);
+      }
       if (incRes.length > 0) {
         setSelectedId((prev) => prev ?? incRes[0].incident_id);
       }

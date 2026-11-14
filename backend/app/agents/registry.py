@@ -18,6 +18,7 @@ SYSTEM_ACTORS = ("negotiation_protocol", "trust_engine", "simulation", "commande
 
 class AgentRegistry:
     def __init__(self, dt_minutes: int, nominal_capacity: float):
+        self.dt_minutes = dt_minutes
         self.public_keys = PublicKeyRegistry()
 
         def key(aid: str) -> SigningKey:
@@ -41,6 +42,16 @@ class AgentRegistry:
 
     def utility_ids(self) -> list[str]:
         return list(self.consumers) + ["battery_agent", "grid_agent"]
+
+    def add_consumer(self, profile: ConsumerProfile) -> ConsumerAgent:
+        aid = profile.agent_id
+        k = crypto.generate(aid)
+        self.public_keys.register(aid, k.kid, k.public_key())
+        cls = AGENT_CLASSES.get(aid, ConsumerAgent)
+        agent = cls(profile, k, self.dt_minutes)
+        self.consumers[aid] = agent
+        self._participants = frozenset(self.public_keys.participants())
+        return agent
 
     def get(self, agent_id: str):
         if agent_id in self.consumers:
