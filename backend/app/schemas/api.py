@@ -23,6 +23,17 @@ class Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def example(value: dict[str, Any]) -> ConfigDict:
+    """Strict config plus a request example that Swagger UI pre-fills and that the API accepts."""
+    return ConfigDict(extra="forbid", json_schema_extra={"examples": [value]})
+
+
+# Above every consumer's safe minimum and within the baseline supply, so it validates as-is.
+EXAMPLE_ALLOCATION = {"hospital_agent": 95.0, "water_agent": 60.0, "telecom_agent": 30.0, "emergency_agent": 40.0}
+PROPOSAL_ID_DOC = ("ID of a pending proposal (e.g. 'prop-1a2b3c4d5e6f'); see 'pending_proposals' in "
+                   "GET /api/simulation/state or 'proposal_id' in the POST /api/negotiation/start response")
+
+
 class ResetRequest(Strict):
     scenario: ScenarioName = "grid_shortage"
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
@@ -55,8 +66,11 @@ def _check_params(v: dict[str, Any]) -> dict[str, Any]:
 
 
 class EventInjectRequest(Strict):
+    model_config = example({"event_type": "power_reduction", "params": {"percent": 30}})
+
     event_type: EventType
-    params: dict[str, Any] = Field(default_factory=dict)
+    params: dict[str, Any] = Field(default_factory=dict,
+                                   description="event-specific scalar params; see GET /api/events/catalog")
 
     @field_validator("params")
     @classmethod
@@ -65,8 +79,10 @@ class EventInjectRequest(Strict):
 
 
 class FakeInjectRequest(Strict):
+    model_config = example({"kind": "false_capacity_drop", "params": {}})
+
     kind: FakeKind = "false_capacity_drop"
-    params: dict[str, Any] = Field(default_factory=dict)
+    params: dict[str, Any] = Field(default_factory=dict, description="optional scalar params for the fake event")
 
     @field_validator("params")
     @classmethod
@@ -84,8 +100,11 @@ def _check_alloc(v: dict[str, float] | None) -> dict[str, float] | None:
 
 
 class ValidateRequest(Strict):
-    allocation: dict[ConsumerId, float] | None = None
-    proposal_id: str | None = Field(default=None, min_length=4, max_length=64)
+    """Send exactly one of ``allocation`` or ``proposal_id``."""
+    model_config = example({"allocation": EXAMPLE_ALLOCATION})
+
+    allocation: dict[ConsumerId, float] | None = Field(default=None, description="MW per consumer agent")
+    proposal_id: str | None = Field(default=None, min_length=4, max_length=64, description=PROPOSAL_ID_DOC)
 
     @field_validator("allocation")
     @classmethod
@@ -100,12 +119,12 @@ class ValidateRequest(Strict):
 
 
 class CommitRequest(Strict):
-    proposal_id: str = Field(min_length=4, max_length=64)
+    proposal_id: str = Field(min_length=4, max_length=64, description=PROPOSAL_ID_DOC)
 
 
 class RejectRequest(Strict):
-    proposal_id: str = Field(min_length=4, max_length=64)
-    reason: str = Field(min_length=3, max_length=300)
+    proposal_id: str = Field(min_length=4, max_length=64, description=PROPOSAL_ID_DOC)
+    reason: str = Field(min_length=3, max_length=300, examples=["allocation starves telecom"])
 
 
 class NegotiationStartRequest(Strict):
@@ -113,7 +132,11 @@ class NegotiationStartRequest(Strict):
 
 
 class OverrideRequest(Strict):
-    allocation: dict[ConsumerId, float]
+    model_config = example({"allocation": EXAMPLE_ALLOCATION, "reason": "commander manual allocation"})
+
+    allocation: dict[ConsumerId, float] = Field(
+        description="MW for all four consumer agents; each must be at least its safe minimum and the total "
+                    "must fit current supply (see 'agents' and 'supply' in GET /api/simulation/state)")
     reason: str = Field(min_length=5, max_length=300)
 
     @field_validator("allocation")
@@ -131,6 +154,9 @@ class ExplainRequest(Strict):
 
 
 class ResolveIncidentRequest(Strict):
+    """Only incidents escalated to the commander can be resolved; IDs come from GET /api/trust/incidents."""
+    model_config = example({"action": "dismiss", "note": "verified with field crew"})
+
     action: Literal["confirm_claim", "dismiss"]
     note: str = Field(default="", max_length=300)
     confirmed_supply_mw: float | None = Field(default=None, ge=0, le=10_000)

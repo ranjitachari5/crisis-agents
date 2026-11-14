@@ -14,6 +14,7 @@ from app.api.auth import ADMIN, COMMANDER, VIEWER, TokenRegistry
 from app.config import Settings, configure_logging, get_settings
 from app.database.repository import Repository
 from app.llm.service import LLMService
+from app.schemas.api import ErrorResponse
 from app.simulation.engine import EngineError
 from app.simulation.runtime import RunManager
 from app.websocket.routes import router as ws_router
@@ -116,12 +117,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if settings.test_routes_enabled:
         groups.append((routes.test, ADMIN))
     scoped = [Depends(routes.run_id_param)]
+    # Document the real error envelope (replaces FastAPI's default {"detail": [...]} 422 schema).
+    errors = {code: {"model": ErrorResponse, "description": desc} for code, desc in (
+        (403, "Missing or invalid bearer token, or insufficient role"),
+        (404, "Unknown run, agent, proposal, incident or alert"),
+        (409, "Not allowed in the current state (e.g. ALREADY_RUNNING, NOT_PAUSED, VALIDATION_FAILED)"),
+        (422, "Request validation failed"))}
     for router, role in groups:
-        app.include_router(router, prefix="/api", dependencies=[Depends(role)])
-        app.include_router(router, prefix="/api/runs/{run_id}", dependencies=[Depends(role), *scoped])
-    app.include_router(routes.runs_read, dependencies=[Depends(VIEWER)])
-    app.include_router(routes.runs_control, dependencies=[Depends(COMMANDER)])
-    app.include_router(routes.runs_admin, dependencies=[Depends(ADMIN)])
+        app.include_router(router, prefix="/api", dependencies=[Depends(role)], responses=errors)
+        app.include_router(router, prefix="/api/runs/{run_id}", dependencies=[Depends(role), *scoped],
+                           responses=errors)
+    app.include_router(routes.runs_read, dependencies=[Depends(VIEWER)], responses=errors)
+    app.include_router(routes.runs_control, dependencies=[Depends(COMMANDER)], responses=errors)
+    app.include_router(routes.runs_admin, dependencies=[Depends(ADMIN)], responses=errors)
     app.include_router(routes.metrics_router, dependencies=[Depends(VIEWER)])
     app.include_router(ws_router)
     return app
