@@ -1188,6 +1188,9 @@ class SimulationEngine:
             "tick": self.city.tick, "sim_time": self.city.sim_time.isoformat(), "fairness": self.fairness,
             "verified_supply_mw": self.grid_assessment.verified_supply,
             "battery_capability_mw": self.battery_capability(),
+            "battery_discharge_mw": self.city.battery.discharge_mw,
+            "battery_soc": round(self.city.battery.soc, 2),
+            "battery_usable_mwh": round(self.city.battery.usable_energy_mwh, 1),
             "agents": {a["agent_id"]: {k: a.get(k) for k in ("status", "demand_mw", "min_safe_mw", "allocation_mw",
                                                              "urgency", "service_level")}
                        for a in self.agents() if a["kind"] == "consumer"},

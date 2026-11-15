@@ -9,6 +9,8 @@ import {
 } from "lucide-react";
 import { MetricTile } from "@/components/MetricTile";
 import { FairnessSlider } from "@/components/FairnessSlider";
+import { CommanderSitRep } from "@/components/CommanderSitRep";
+import { CommanderCopilot } from "@/components/CommanderCopilot";
 import { Toast, type ToastMessage } from "@/components/Toast";
 import { formatMw, formatPct } from "@/lib/format";
 import { api } from "@/services/api";
@@ -224,6 +226,10 @@ export function OverviewSection() {
           </div>
         </div>
       )}
+
+      {/* Commander Intelligence Suite */}
+      <CommanderSitRep />
+      <CommanderCopilot />
 
       {/* Metric Tiles: 7 key metrics */}
       <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">

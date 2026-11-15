@@ -531,3 +531,56 @@ export interface CreateAgentRequest {
   dependencies?: Record<string, number>;
   start_negotiation?: boolean;
 }
+
+export interface ExplainResponse {
+  text: string;
+  source: string;
+  advisory_only: boolean;
+  generated: boolean;
+  label: string;
+  deterministic_summary?: string;
+  facts?: {
+    tick: number;
+    sim_time: string;
+    fairness: number;
+    verified_supply_mw: number;
+    battery_capability_mw: number;
+    agents: Record<
+      string,
+      {
+        status: string;
+        demand_mw: number;
+        min_safe_mw: number;
+        allocation_mw: number;
+        urgency: number;
+        service_level: number;
+      }
+    >;
+    agreement?: {
+      version: number;
+      method: string;
+      allocation: Record<string, number>;
+      degradation_mode: boolean;
+      battery_discharge_mw: number;
+    } | null;
+    last_negotiation?: {
+      method: string;
+      rounds: number;
+      converged: boolean;
+      fallback_used: boolean;
+      degradation: boolean;
+      final_positions: Record<string, number>;
+      demands: Record<string, number>;
+    } | null;
+    cascades?: Array<{
+      root: string;
+      cause: string;
+      path: string[];
+    }>;
+    open_trust_incidents?: Array<{
+      kind: string;
+      decision: string;
+      sender: string;
+    }>;
+  };
+}

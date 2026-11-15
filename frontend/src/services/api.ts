@@ -15,6 +15,7 @@ import type {
   EvaluationRun,
   EventCatalog,
   EventType,
+  ExplainResponse,
   FakeKind,
   HealthResponse,
   IncidentResolveAction,
@@ -184,7 +185,7 @@ export const api = {
 
   commander: {
     explain: (question?: string) =>
-      request<Record<string, unknown>>("/api/commander/explain", {
+      request<ExplainResponse>("/api/commander/explain", {
         method: "POST",
         ...jsonBody({ question: question ?? null }),
       }),

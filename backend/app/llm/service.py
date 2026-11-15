@@ -32,9 +32,9 @@ SYSTEM_PROMPT = (
 )
 GENERATED_LABEL = "AI-generated explanation (advisory only; deterministic facts shown alongside)"
 SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_.:+\-#>]{0,64}$")   # identifiers, enums, ISO timestamps, numbers
-MAX_OUTPUT_CHARS = 1200
-EXPLAIN_MAX_TOKENS = 300
-SUMMARY_MAX_TOKENS = 200
+MAX_OUTPUT_CHARS = 2000
+EXPLAIN_MAX_TOKENS = 500
+SUMMARY_MAX_TOKENS = 300
 
 
 def sanitize_facts(obj: Any, depth: int = 0) -> Any:
@@ -70,6 +70,7 @@ class LLMService:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.model = settings.groq_model
+        self.active_model = settings.groq_model
         self._client = None
         self.last_error: str | None = None
         if settings.llm_configured:
@@ -86,27 +87,37 @@ class LLMService:
         return self._client is not None
 
     def status(self) -> dict:
-        return {"provider": "groq", "model": self.model, "configured": self.settings.llm_configured,
+        return {"provider": "groq", "model": self.active_model, "configured": self.settings.llm_configured,
                 "available": self.available, "last_error": self.last_error}
 
     async def complete(self, prompt: str, max_tokens: int = EXPLAIN_MAX_TOKENS) -> str | None:
         if not self._client:
             return None
-        try:
-            kwargs: dict[str, Any] = dict(model=self.model, max_tokens=max_tokens, temperature=0.2,
-                                          messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                                                    {"role": "user", "content": prompt}])
-            if "gpt-oss" in self.model:
-                kwargs["reasoning_effort"] = "low"
-            resp = await asyncio.wait_for(self._client.chat.completions.create(**kwargs),
-                                          timeout=self.settings.llm_timeout_s + 2)
-            text = clean_output(resp.choices[0].message.content or "")
-            self.last_error = None
-            return text or None
-        except Exception as exc:
-            self.last_error = f"{type(exc).__name__}: {exc}"[:300]
-            log.warning("Groq call failed, using deterministic fallback: %s", self.last_error)
-            return None
+        candidate_models = [self.model, "openai/gpt-oss-20b", "qwen/qwen3.8-27b", "openai/gpt-oss-120b"]
+        seen = set()
+        models_to_try = [m for m in candidate_models if not (m in seen or seen.add(m))]
+
+        for candidate in models_to_try:
+            try:
+                kwargs: dict[str, Any] = dict(model=candidate, max_tokens=max_tokens, temperature=0.2,
+                                              messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                                                        {"role": "user", "content": prompt}])
+                if "gpt-oss" in candidate:
+                    kwargs["reasoning_effort"] = "low"
+                resp = await asyncio.wait_for(self._client.chat.completions.create(**kwargs),
+                                              timeout=self.settings.llm_timeout_s + 2)
+                text = clean_output(resp.choices[0].message.content or "")
+                if text:
+                    self.active_model = candidate
+                    self.last_error = None
+                    return text
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"[:300]
+                log.warning("Groq model %s failed: %s", candidate, self.last_error)
+                continue
+
+        log.warning("All Groq candidate models failed, using deterministic fallback: %s", self.last_error)
+        return None
 
     @staticmethod
     def build_prompt(task: str, facts: dict, question: str | None = None) -> str:
@@ -119,7 +130,7 @@ class LLMService:
         deterministic = deterministic_explanation(facts)
         text = await self.complete(self.build_prompt("explain", facts, question))
         if text:
-            return {"text": text, "source": f"groq:{self.model}", "advisory_only": True, "generated": True,
+            return {"text": text, "source": f"groq:{self.active_model}", "advisory_only": True, "generated": True,
                     "label": GENERATED_LABEL, "deterministic_summary": deterministic}
         return {"text": deterministic, "source": "deterministic_template", "advisory_only": True,
                 "generated": False, "label": "Deterministic summary", "deterministic_summary": deterministic}
@@ -130,7 +141,7 @@ class LLMService:
                                    "and any safety implications.", facts)
         text = await self.complete(prompt, max_tokens=SUMMARY_MAX_TOKENS)
         if text:
-            return {"text": text, "source": f"groq:{self.model}", "generated": True, "label": GENERATED_LABEL,
+            return {"text": text, "source": f"groq:{self.active_model}", "generated": True, "label": GENERATED_LABEL,
                     "deterministic_summary": deterministic}
         return {"text": deterministic, "source": "deterministic_template", "generated": False,
                 "label": "Deterministic summary", "deterministic_summary": deterministic}

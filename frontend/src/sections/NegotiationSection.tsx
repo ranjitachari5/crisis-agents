@@ -6,6 +6,7 @@ import { MessageBubble } from "@/components/MessageBubble";
 import { ProposalList } from "@/components/ProposalList";
 import { AgreementList } from "@/components/AgreementList";
 import { Toast, type ToastMessage } from "@/components/Toast";
+import { CommanderSitRep } from "@/components/CommanderSitRep";
 import { FILTER_TABS, matchesFilter, type ChatFilter } from "@/lib/messageKinds";
 import { AGENT_IDS } from "@/lib/agents";
 import { api } from "@/services/api";
@@ -255,6 +256,9 @@ export function NegotiationSection() {
           </button>
         </div>
       </div>
+
+      {/* Pinned Executive SitRep Banner */}
+      <CommanderSitRep compact />
 
       {/* Side-by-side grid */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
